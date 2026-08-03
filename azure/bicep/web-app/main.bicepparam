@@ -13,10 +13,6 @@ param linuxFxVersion = 'NODE|22-lts'
 // The Node server serves the Vite build and hosts the WebSocket lobby.
 param appCommandLine = 'npm start'
 
-// Regional VNet integration is not needed yet; the game server has no private
-// backend. Set this to the id of snet-dokken-webapp to turn it on.
-param virtualNetworkSubnetId = ''
-
 param tags = {
   workload: 'whatabomb'
   environment: 'prod'

@@ -836,3 +836,223 @@ body {
     padding: 20px 60px !important;
   }
 }
+
+/* ── Online lobby ─────────────────────────────────────────────────────────── */
+
+.lobby-status {
+  font-family: 'Russo One', sans-serif;
+  font-size: 13px;
+  color: #9ca3af;
+  margin-bottom: 18px;
+  letter-spacing: 1px;
+}
+
+.lobby-panel {
+  width: 100%;
+  max-width: 420px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.lobby-divider {
+  text-align: center;
+  font-size: 11px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+
+.lobby-code-row {
+  display: flex;
+  gap: 10px;
+}
+
+.lobby-code-input {
+  flex: 1;
+  min-width: 0;
+  padding: 12px;
+  border-radius: 8px;
+  border: 2px solid #4b5563;
+  background: linear-gradient(180deg, #1a1a2e 0%, #0f0f1a 100%);
+  color: #fff;
+  font-family: 'Press Start 2P', monospace;
+  font-size: 18px;
+  letter-spacing: 6px;
+  text-align: center;
+  outline: none;
+}
+
+.lobby-code-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.4);
+}
+
+.lobby-code-row .menu-button {
+  width: auto !important;
+  font-size: 14px !important;
+  padding: 12px 20px !important;
+  margin: 0 !important;
+}
+
+.lobby-code-display {
+  font-family: 'Press Start 2P', monospace;
+  font-size: 34px;
+  letter-spacing: 10px;
+  text-align: center;
+  color: #ffae00;
+  text-shadow: 0 0 18px rgba(255, 174, 0, 0.5);
+  cursor: pointer;
+  user-select: all;
+  padding: 6px 0;
+}
+
+.lobby-hint {
+  text-align: center;
+  font-size: 11px;
+  color: #6b7280;
+  margin-top: -10px;
+}
+
+.lobby-players {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lobby-player {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 2px solid transparent;
+  font-family: 'Russo One', sans-serif;
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.lobby-player.is-ready {
+  border-color: #22c55e;
+  background: rgba(34, 197, 94, 0.12);
+}
+
+.lobby-player.is-empty {
+  opacity: 0.35;
+  border-style: dashed;
+  border-color: #4b5563;
+}
+
+.lobby-player.is-gone {
+  opacity: 0.5;
+  border-color: #b45309;
+}
+
+.lp-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #4b5563;
+  flex: none;
+  box-shadow: 0 0 8px currentColor;
+}
+
+.lp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lp-tags {
+  display: flex;
+  gap: 5px;
+}
+
+.lp-tag {
+  font-family: 'Press Start 2P', monospace;
+  font-size: 7px;
+  padding: 4px 5px;
+  border-radius: 4px;
+}
+
+.lp-host {
+  background: #ffae00;
+  color: #1a1a2e;
+}
+
+.lp-wins {
+  background: rgba(255, 255, 255, 0.15);
+  color: #e5e7eb;
+}
+
+.lp-state {
+  width: 18px;
+  text-align: center;
+  color: #9ca3af;
+}
+
+.lobby-player.is-ready .lp-state {
+  color: #4ade80;
+}
+
+.lobby-blocked {
+  text-align: center;
+  font-size: 12px;
+  color: #fbbf24;
+  min-height: 16px;
+}
+
+.lobby-blocked.is-good {
+  color: #4ade80;
+}
+
+.lobby-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.lobby-actions .menu-button {
+  flex: 1;
+  width: auto !important;
+  margin: 0 !important;
+  font-size: 14px !important;
+  padding: 14px 10px !important;
+}
+
+.lobby-actions .menu-button.is-active {
+  background: linear-gradient(180deg, #f59e0b 0%, #b45309 100%) !important;
+  border-color: #92400e !important;
+}
+
+.lobby-actions .menu-button.is-armed {
+  animation: powerupToggleGlow 2s ease-in-out infinite;
+}
+
+.lobby-actions .menu-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: grayscale(0.7);
+}
+
+.lobby-error {
+  margin-top: 14px;
+  min-height: 20px;
+  color: #f87171;
+  font-family: 'Russo One', sans-serif;
+  font-size: 13px;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  text-align: center;
+}
+
+@media (max-width: 768px) {
+  .lobby-code-display { font-size: 24px; letter-spacing: 6px; }
+  .lobby-panel { padding: 16px; }
+}

@@ -48,6 +48,8 @@ import {
   findPathToTarget,
 } from './ai-bomb-logic'
 import { generateMap, type SpawnPoint } from './map-gen'
+import { NetClient } from './net/client'
+import { createLobbyScreen } from './net/lobby-screen'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -5025,6 +5027,30 @@ const mapSelectionScreen = createMapSelectionScreen(
 )
 document.body.appendChild(mapSelectionScreen)
 
+// ── Online lobby ────────────────────────────────────────────────────────────
+// The server owns lobby state; this screen only renders what it sends back.
+const netClient = new NetClient()
+
+const lobbyScreen = createLobbyScreen({
+  net: netClient,
+  getPlayerName: () => sanitizePlayerName(settingsManager.getSettings().playerName),
+  onBack: () => {
+    lobbyScreen.style.display = 'none'
+    mainMenu.style.display = 'flex'
+  },
+  // Integration point for networked play. The lobby handshake is complete —
+  // every client gets the same seed here, which generateMap()'s seed parameter
+  // turns into an identical arena. What is still missing is the in-match layer:
+  // spawning the other lobby players in the scene, relaying inputs to the host,
+  // and applying the host's snapshots on the guests.
+  onMatchStart: info => {
+    console.log(
+      `[net] round ${info.round} starting, seed ${info.seed}, host=${info.youAreHost}`,
+    )
+  },
+})
+document.body.appendChild(lobbyScreen)
+
 // Add global menu sound effects
 // This plays sounds for any menu button interactions
 document.addEventListener('mouseenter', (e) => {
@@ -5071,6 +5097,10 @@ mainMenu.addEventListener('click', (e) => {
     case 'map-selection-button':
       mainMenu.style.display = 'none'
       mapSelectionScreen.style.display = 'flex'
+      break
+    case 'online-button':
+      mainMenu.style.display = 'none'
+      lobbyScreen.style.display = 'flex'
       break
     case 'fullscreen-button':
       toggleFullscreen()

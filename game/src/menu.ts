@@ -178,6 +178,7 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
     { id: 'achievements-button', text: '🏆 Achievements' },
     { id: 'tutorial-button', text: '📖 How to Play' },
     { id: 'map-selection-button', text: '🗺️ Maps' },
+    { id: 'online-button', text: '🌐 Play Online' },
     ...(isIOS() ? [] : [{ id: 'fullscreen-button', text: '⛶ Fullscreen' }]),
   ]
 

@@ -168,7 +168,25 @@ function countDestructibles(grid: Grid, width: number, height: number): number {
   return n
 }
 
-function generateBase(width: number, height: number, theme: MapTheme): Grid {
+/**
+ * Small deterministic PRNG (mulberry32).
+ *
+ * Online matches must build a byte-identical arena on every client, so map
+ * generation cannot use Math.random. The server sends one seed with matchStart
+ * and everyone derives the same layout from it.
+ */
+export function createRng(seed: number): () => number {
+  let a = seed >>> 0
+  return function rng() {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+function generateBase(width: number, height: number, theme: MapTheme, rng: () => number): Grid {
   const grid: Grid = []
 
   for (let y = 0; y < height; y++) {
@@ -202,23 +220,23 @@ function generateBase(width: number, height: number, theme: MapTheme): Grid {
           if (isChannel) {
             row.push('wall')
           } else {
-            row.push(Math.random() < 0.7 ? 'destructible' : 'empty')
+            row.push(rng() < 0.7 ? 'destructible' : 'empty')
           }
         } else if (theme === 'ice') {
           // Ice: less clutter, more open space
-          row.push(Math.random() < 0.58 ? 'destructible' : 'empty')
+          row.push(rng() < 0.58 ? 'destructible' : 'empty')
         } else if (theme === 'forest') {
           // Forest: organic clusters - denser beside pillars, clearings elsewhere
           const nearPillar = isPillar(x - 1, y) || isPillar(x + 1, y) ||
                              isPillar(x, y - 1) || isPillar(x, y + 1)
-          row.push(Math.random() < (nearPillar ? 0.85 : 0.6) ? 'destructible' : 'empty')
+          row.push(rng() < (nearPillar ? 0.85 : 0.6) ? 'destructible' : 'empty')
         } else if (theme === 'space' || theme === 'moon') {
           // Space: open "rooms" joined by denser corridors
           const inRoom = (x % 5 >= 1 && x % 5 <= 3 && y % 5 >= 1 && y % 5 <= 3)
-          row.push(Math.random() < (inRoom ? 0.35 : 0.8) ? 'destructible' : 'empty')
+          row.push(rng() < (inRoom ? 0.35 : 0.8) ? 'destructible' : 'empty')
         } else {
           // Classic: standard Bomberman density
-          row.push(Math.random() < 0.74 ? 'destructible' : 'empty')
+          row.push(rng() < 0.74 ? 'destructible' : 'empty')
         }
       }
     }
@@ -228,11 +246,11 @@ function generateBase(width: number, height: number, theme: MapTheme): Grid {
   // --- Theme-specific structural features ---
   if (theme === 'forest') {
     // Small "clearing" circles that open up sight lines
-    const clearings = 2 + Math.floor(Math.random() * 2)
+    const clearings = 2 + Math.floor(rng() * 2)
     for (let c = 0; c < clearings; c++) {
-      const cx = 3 + Math.floor(Math.random() * (width - 6))
-      const cy = 3 + Math.floor(Math.random() * (height - 6))
-      const r = 1.5 + Math.random()
+      const cx = 3 + Math.floor(rng() * (width - 6))
+      const cy = 3 + Math.floor(rng() * (height - 6))
+      const r = 1.5 + rng()
       for (let dy = -2; dy <= 2; dy++) {
         for (let dx = -2; dx <= 2; dx++) {
           const nx = cx + dx, ny = cy + dy
@@ -248,10 +266,10 @@ function generateBase(width: number, height: number, theme: MapTheme): Grid {
 
   if (theme === 'moon') {
     // "Crater" rings - circular walls of rubble with a clear middle
-    const craters = 1 + Math.floor(Math.random() * 2)
+    const craters = 1 + Math.floor(rng() * 2)
     for (let c = 0; c < craters; c++) {
-      const cx = 4 + Math.floor(Math.random() * (width - 8))
-      const cy = 4 + Math.floor(Math.random() * (height - 8))
+      const cx = 4 + Math.floor(rng() * (width - 8))
+      const cy = 4 + Math.floor(rng() * (height - 8))
       const r = 2.5
       for (let dy = -3; dy <= 3; dy++) {
         for (let dx = -3; dx <= 3; dx++) {
@@ -284,8 +302,11 @@ export function generateMap(
   height: number,
   theme: MapTheme,
   paddingBottom: number = 0,
+  /** Supply a seed for online matches so every client builds the same arena. */
+  seed?: number,
 ): GeneratedMap {
-  const grid = generateBase(width, height, theme)
+  const rng = seed === undefined ? Math.random : createRng(seed)
+  const grid = generateBase(width, height, theme, rng)
 
   // Fair, designed-looking layouts: every corner gets the same opening.
   if (width === height) symmetrize(grid, width)

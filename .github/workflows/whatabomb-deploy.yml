@@ -107,9 +107,7 @@ jobs:
           region: ${{ env.location }}
           subscriptionId: ${{ env.subscriptionId }}
           template: azure/bicep/web-app/main.bicep
-          parameters:
-            location=${{ env.location }}
-            tags=${{ env.tags }}
+          additionalArguments: '--parameters @azure/bicep/web-app/main.bicepparam'
           deploymentName: whatabomb-${{ env.releaseVersion }}
 
     # Surfaced so the game job targets whatever the template actually named,
