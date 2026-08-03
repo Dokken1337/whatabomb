@@ -1,0 +1,33 @@
+{
+  "name": "whata-bomb",
+  "private": true,
+  "version": "10.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "main": "dist-server/server/index.js",
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "tsc -p tsconfig.server.json --watch",
+    "build": "tsc && vite build && npm run build:server",
+    "build:server": "tsc -p tsconfig.server.json",
+    "preview": "vite preview",
+    "build:prod": "tsc && vite build --mode production && npm run build:server",
+    "start": "node dist-server/server/index.js",
+    "test:server": "node --test \"test/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@babylonjs/core": "^8.47.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  },
+  "//dependencies": "Runtime deps only. Babylon is bundled into dist/ by Vite at build time and is never required by the Node server, so it belongs in devDependencies — this keeps the deployed node_modules small.",
+  "dependencies": {
+    "express": "^5.1.0",
+    "ws": "^8.18.0"
+  }
+}

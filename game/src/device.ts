@@ -7,6 +7,13 @@ export function isIOS(): boolean {
   return /iPad|iPhone|iPod/.test(navigator.userAgent) && !('MSStream' in window)
 }
 
+/** Resolve the on-screen-controls setting against the current device. */
+export function showOnScreenControls(mode: 'auto' | 'on' | 'off'): boolean {
+  if (mode === 'on') return true
+  if (mode === 'off') return false
+  return isMobile()
+}
+
 let hapticsEnabled = true
 
 /** Enable or disable haptic feedback globally. */

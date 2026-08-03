@@ -34,6 +34,19 @@ export default defineConfig({
     strictPort: false,
     open: true,
     host: true, // Listen on all addresses
+    // The lobby lives on the Node server. Proxying /ws lets `npm run dev` keep
+    // HMR while multiplayer talks to `npm start` on 8080.
+    proxy: {
+      '/ws': {
+        target: process.env.GAME_SERVER ?? 'ws://127.0.0.1:8080',
+        ws: true,
+        changeOrigin: true,
+      },
+      '/healthz': {
+        target: (process.env.GAME_SERVER ?? 'ws://127.0.0.1:8080').replace(/^ws/, 'http'),
+        changeOrigin: true,
+      },
+    },
   },
   base: './', // Ensure relative paths for simplified deployment
   // Preview settings (for testing production build)

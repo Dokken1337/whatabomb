@@ -1,4 +1,11 @@
-import { SettingsManager, PLAYER_COLORS, CHARACTER_SHAPES } from './settings'
+import {
+  SettingsManager,
+  PLAYER_COLORS,
+  CHARACTER_SHAPES,
+  MAX_PLAYER_NAME_LENGTH,
+  DEFAULT_PLAYER_NAME,
+  sanitizePlayerName,
+} from './settings'
 import { SoundManager } from './sound-manager'
 import { setHapticsEnabled } from './device'
 
@@ -44,6 +51,19 @@ export function createSettingsMenu(
   settingsContainer.style.border = '2px solid rgba(255,255,255,0.1)'
 
   const settings = settingsManager.getSettings()
+
+  // Player Name — shown on the HUD and scoreboards, and ready to identify this
+  // player once online multiplayer lands.
+  const playerNameSection = createTextSetting(
+    '🙋 Player Name',
+    settings.playerName,
+    DEFAULT_PLAYER_NAME,
+    MAX_PLAYER_NAME_LENGTH,
+    (value) => {
+      settingsManager.setPlayerName(value)
+    }
+  )
+  settingsContainer.appendChild(playerNameSection)
 
   // Music Volume
   const musicSection = createSliderSetting(
@@ -120,6 +140,30 @@ export function createSettingsMenu(
   extendedPowerUpsDesc.innerHTML = 'Adds 5 new power-ups: 🛡️ Shield, 🔥 Pierce, 👻 Ghost, ☢️ Power Bomb, 🧨 Line Bomb'
   settingsContainer.appendChild(extendedPowerUpsDesc)
 
+  // On-Screen Controls (touch pad works on desktop too, driven by the mouse)
+  const onScreenControlsSection = createSegmentedSetting(
+    '🕹️ On-Screen Controls',
+    [
+      { label: 'AUTO', value: 'auto' },
+      { label: 'ON', value: 'on' },
+      { label: 'OFF', value: 'off' },
+    ],
+    settings.onScreenControls,
+    (value) => {
+      settingsManager.setOnScreenControls(value as any)
+    }
+  )
+  settingsContainer.appendChild(onScreenControlsSection)
+
+  const onScreenControlsDesc = document.createElement('div')
+  onScreenControlsDesc.style.fontSize = '11px'
+  onScreenControlsDesc.style.color = '#888'
+  onScreenControlsDesc.style.marginTop = '-18px'
+  onScreenControlsDesc.style.marginBottom = '20px'
+  onScreenControlsDesc.style.lineHeight = '1.5'
+  onScreenControlsDesc.textContent = 'AUTO shows the D-pad on touch devices only. ON keeps it on desktop too (click or drag with the mouse). Applies to the next game.'
+  settingsContainer.appendChild(onScreenControlsDesc)
+
   // Difficulty Selection
   const difficultySection = createDifficultySetting(
     settings.difficulty,
@@ -128,6 +172,21 @@ export function createSettingsMenu(
     }
   )
   settingsContainer.appendChild(difficultySection)
+
+  // Match length (rounds) for the versus modes
+  const roundsSection = createSegmentedSetting(
+    '🏁 Match Length',
+    [
+      { label: '1 ROUND', value: '1' },
+      { label: 'BEST OF 3', value: '3' },
+      { label: 'BEST OF 5', value: '5' },
+    ],
+    String(settings.rounds),
+    (value) => {
+      settingsManager.setRounds(Number(value) as 1 | 3 | 5)
+    }
+  )
+  settingsContainer.appendChild(roundsSection)
 
   // Character Shape Selection
   const characterShapeSection = createDropdownSetting(
@@ -200,7 +259,164 @@ export function createSettingsMenu(
   })
   settingsDiv.appendChild(closeButton)
 
+  // Re-read the settings that can also be changed outside this screen, so the
+  // controls never disagree with what is actually stored.
+  ;(settingsDiv as any).refresh = () => {
+    const current = settingsManager.getSettings()
+    ;(extendedPowerUpsSection as any).setValue?.(current.extendedPowerUps)
+    ;(playerNameSection as any).setValue?.(current.playerName)
+  }
+
   return settingsDiv
+}
+
+/** Short free-text field with a live character counter. */
+function createTextSetting(
+  label: string,
+  initialValue: string,
+  placeholder: string,
+  maxLength: number,
+  onChange: (value: string) => void
+): HTMLDivElement {
+  const section = document.createElement('div')
+  section.style.marginBottom = '25px'
+
+  const labelDiv = document.createElement('div')
+  labelDiv.style.fontFamily = "'Russo One', sans-serif"
+  labelDiv.style.fontSize = '16px'
+  labelDiv.style.marginBottom = '12px'
+  labelDiv.style.display = 'flex'
+  labelDiv.style.justifyContent = 'space-between'
+  labelDiv.style.color = '#e5e5e5'
+
+  const labelText = document.createElement('span')
+  labelText.textContent = label
+
+  const counter = document.createElement('span')
+  counter.style.color = '#fbbf24'
+  counter.style.fontSize = '13px'
+  const updateCounter = (v: string) => {
+    counter.textContent = `${v.length}/${maxLength}`
+  }
+  updateCounter(initialValue)
+
+  labelDiv.appendChild(labelText)
+  labelDiv.appendChild(counter)
+
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.value = initialValue
+  input.placeholder = placeholder
+  input.maxLength = maxLength
+  input.autocomplete = 'off'
+  input.spellcheck = false
+  input.style.width = '100%'
+  input.style.padding = '10px 12px'
+  input.style.borderRadius = '8px'
+  input.style.border = '2px solid #4b5563'
+  input.style.background = 'linear-gradient(180deg, #1a1a2e 0%, #0f0f1a 100%)'
+  input.style.color = 'white'
+  input.style.fontFamily = "'Russo One', sans-serif"
+  input.style.fontSize = '15px'
+  input.style.outline = 'none'
+
+  input.addEventListener('focus', () => {
+    input.style.border = '2px solid #3b82f6'
+    input.style.boxShadow = '0 0 10px rgba(59,130,246,0.4)'
+  })
+  input.addEventListener('blur', () => {
+    input.style.border = '2px solid #4b5563'
+    input.style.boxShadow = 'none'
+    // Snap the field to whatever actually got stored (trimmed / defaulted).
+    input.value = sanitizePlayerName(input.value)
+    updateCounter(input.value)
+  })
+  input.addEventListener('input', () => {
+    updateCounter(input.value)
+    onChange(input.value)
+  })
+  // The game listens on window for keys, so typing here would also drive the
+  // player. Menus are only open while paused, but stop propagation anyway.
+  input.addEventListener('keydown', (e) => e.stopPropagation())
+  input.addEventListener('keyup', (e) => e.stopPropagation())
+
+  ;(section as any).setValue = (value: string) => {
+    if (document.activeElement === input) return // don't fight the user mid-type
+    input.value = value
+    updateCounter(value)
+  }
+
+  section.appendChild(labelDiv)
+  section.appendChild(input)
+  return section
+}
+
+/** A row of mutually exclusive pill buttons, styled like the difficulty picker. */
+function createSegmentedSetting(
+  label: string,
+  options: Array<{ label: string; value: string }>,
+  currentValue: string,
+  onChange: (value: string) => void
+): HTMLDivElement {
+  const section = document.createElement('div')
+  section.style.marginBottom = '25px'
+
+  const labelDiv = document.createElement('div')
+  labelDiv.textContent = label
+  labelDiv.style.fontFamily = "'Russo One', sans-serif"
+  labelDiv.style.fontSize = '16px'
+  labelDiv.style.marginBottom = '12px'
+  labelDiv.style.color = '#e5e5e5'
+
+  const buttonsDiv = document.createElement('div')
+  buttonsDiv.style.display = 'flex'
+  buttonsDiv.style.gap = '10px'
+
+  const buttons: HTMLButtonElement[] = []
+
+  const applySelected = (button: HTMLButtonElement) => {
+    button.style.background = 'linear-gradient(180deg, #3b82f6 0%, #1d4ed8 100%)'
+    button.style.border = '3px solid #1d4ed8'
+    button.style.color = '#fff'
+    button.style.boxShadow = '0 0 15px rgba(59,130,246,0.5), 0 4px 0 #1d4ed8'
+    button.style.transform = 'translateY(-2px)'
+  }
+  const applyIdle = (button: HTMLButtonElement) => {
+    button.style.background = 'linear-gradient(180deg, #374151 0%, #1f2937 100%)'
+    button.style.border = '3px solid #4b5563'
+    button.style.color = '#9ca3af'
+    button.style.boxShadow = '0 4px 0 #1f2937'
+    button.style.transform = 'translateY(0)'
+  }
+
+  options.forEach(opt => {
+    const button = document.createElement('button')
+    button.textContent = opt.label
+    button.style.flex = '1'
+    button.style.padding = '12px 6px'
+    button.style.fontFamily = "'Press Start 2P', monospace"
+    button.style.fontSize = '9px'
+    button.style.cursor = 'pointer'
+    button.style.borderRadius = '8px'
+    button.style.fontWeight = 'bold'
+    button.style.transition = 'all 0.2s ease'
+
+    if (opt.value === currentValue) applySelected(button)
+    else applyIdle(button)
+
+    button.addEventListener('click', () => {
+      buttons.forEach(applyIdle)
+      applySelected(button)
+      onChange(opt.value)
+    })
+
+    buttons.push(button)
+    buttonsDiv.appendChild(button)
+  })
+
+  section.appendChild(labelDiv)
+  section.appendChild(buttonsDiv)
+  return section
 }
 
 function createDropdownSetting(
@@ -489,21 +705,33 @@ function createToggleSetting(
   toggleContainer.appendChild(toggleKnob)
 
   let isOn = initialValue
-  toggleContainer.addEventListener('click', () => {
-    isOn = !isOn
+  const paint = () => {
     toggleKnob.style.left = isOn ? '40px' : '4px'
-    toggleTrack.style.background = isOn 
-      ? 'linear-gradient(90deg, #22c55e, #4ade80)' 
+    toggleTrack.style.background = isOn
+      ? 'linear-gradient(90deg, #22c55e, #4ade80)'
       : 'linear-gradient(90deg, #374151, #4b5563)'
     toggleTrack.style.border = '2px solid ' + (isOn ? '#166534' : '#1f2937')
-    toggleTrack.style.boxShadow = isOn 
-      ? '0 0 10px rgba(34, 197, 94, 0.5), inset 0 2px 4px rgba(0,0,0,0.2)' 
+    toggleTrack.style.boxShadow = isOn
+      ? '0 0 10px rgba(34, 197, 94, 0.5), inset 0 2px 4px rgba(0,0,0,0.2)'
       : 'inset 0 2px 4px rgba(0,0,0,0.3)'
     toggleLabel.textContent = isOn ? 'ON' : 'OFF'
     toggleLabel.style.color = isOn ? '#166534' : '#9ca3af'
     toggleLabel.style.left = isOn ? '8px' : '32px'
+  }
+
+  toggleContainer.addEventListener('click', () => {
+    isOn = !isOn
+    paint()
     onChange(isOn)
   })
+
+  // Lets the caller re-sync a toggle that can also be changed from elsewhere
+  // (Extended Power-Ups is on the main menu too) without firing onChange.
+  ;(section as any).setValue = (value: boolean) => {
+    if (value === isOn) return
+    isOn = value
+    paint()
+  }
 
   section.appendChild(labelText)
   section.appendChild(toggleContainer)

@@ -4,6 +4,12 @@ export type GameMode = '1v1' | '1v2' | '1v3' | 'pvp' | 'time-attack' | 'survival
 
 export interface MenuOptions {
   onStartGame: (mode: GameMode) => void
+  /** Opens the online lobby. */
+  onPlayOnline: () => void
+  /** Current state of the Extended Power-Ups setting. */
+  getExtendedPowerUps: () => boolean
+  /** Persist a new Extended Power-Ups state. */
+  onToggleExtendedPowerUps: (enabled: boolean) => void
 }
 
 // Countdown before game starts
@@ -44,6 +50,93 @@ export function showCountdown(onComplete: () => void, onTick?: () => void): void
   updateCountdown()
 }
 
+/**
+ * Overlay asking whether a versus match is on one keyboard or over the network.
+ * Dismissable, so picking PvP by accident is not a dead end.
+ */
+function showVersusChoice(menuDiv: HTMLDivElement, options: MenuOptions): void {
+  const existing = document.getElementById('versus-choice')
+  if (existing) existing.remove()
+
+  const overlay = document.createElement('div')
+  overlay.id = 'versus-choice'
+  overlay.className = 'versus-choice-overlay'
+
+  const panel = document.createElement('div')
+  panel.className = 'versus-choice-panel'
+
+  const heading = document.createElement('h2')
+  heading.textContent = '👥 PLAYER VS PLAYER'
+  heading.className = 'versus-choice-title'
+  panel.appendChild(heading)
+
+  const choices: Array<{ label: string; hint: string; onPick: () => void }> = [
+    {
+      label: '🎮 Local',
+      hint: 'Two players, one keyboard — WASD and Arrow keys',
+      onPick: () => {
+        overlay.remove()
+        menuDiv.style.display = 'none'
+        options.onStartGame('pvp')
+      },
+    },
+    {
+      label: '🌐 Online',
+      hint: 'Up to 4 players, join with a 6-digit code',
+      onPick: () => {
+        overlay.remove()
+        menuDiv.style.display = 'none'
+        options.onPlayOnline()
+      },
+    },
+  ]
+
+  for (const choice of choices) {
+    const button = document.createElement('button')
+    button.className = 'menu-button versus-choice-button'
+
+    const label = document.createElement('span')
+    label.className = 'vc-label'
+    label.textContent = choice.label
+
+    const hint = document.createElement('span')
+    hint.className = 'vc-hint'
+    hint.textContent = choice.hint
+
+    button.append(label, hint)
+    button.addEventListener('click', choice.onPick)
+    panel.appendChild(button)
+  }
+
+  const cancel = document.createElement('button')
+  cancel.className = 'menu-button menu-button-danger versus-choice-cancel'
+  cancel.textContent = '← BACK'
+  cancel.addEventListener('click', () => overlay.remove())
+  panel.appendChild(cancel)
+
+  // Clicking the backdrop or pressing Escape also dismisses.
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.remove()
+  })
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation()
+      overlay.remove()
+    }
+  }
+  window.addEventListener('keydown', onKey, true)
+  const observer = new MutationObserver(() => {
+    if (!overlay.isConnected) {
+      window.removeEventListener('keydown', onKey, true)
+      observer.disconnect()
+    }
+  })
+  observer.observe(document.body, { childList: true })
+
+  overlay.appendChild(panel)
+  document.body.appendChild(overlay)
+}
+
 export function createMainMenu(options: MenuOptions): HTMLDivElement {
   const menuDiv = document.createElement('div')
   menuDiv.id = 'main-menu'
@@ -76,7 +169,7 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   
   // Subtitle
   const subtitle = document.createElement('p')
-  subtitle.textContent = 'By Fredrik, V5.0.1'
+  subtitle.textContent = 'By Fredrik, V10.0.0'
   subtitle.style.fontSize = '16px'
   subtitle.style.color = '#aaa'
   subtitle.style.marginTop = '-30px'
@@ -95,11 +188,12 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
     { mode: 'time-attack', label: 'Time Attack', icon: '⏱️' },
   ]
 
-  // Re-check mobile on menu creation to be safe
+  // Re-check mobile on menu creation to be safe.
+  // Only local PvP is hidden on touch devices — it needs two keyboards.
   const currentIsMobile = isMobile()
 
   const modes = currentIsMobile
-    ? allModes.filter(m => m.mode !== 'pvp' && m.mode !== 'survival' && m.mode !== 'time-attack')
+    ? allModes.filter(m => m.mode !== 'pvp')
     : allModes
 
   // Button container for game modes
@@ -148,6 +242,12 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
       button.style.boxShadow = '0 6px 0 #1B5E20, 0 8px 15px rgba(0,0,0,0.4)'
     })
     button.addEventListener('click', () => {
+      // Player vs Player is ambiguous: same keyboard, or over the network?
+      // Ask rather than guessing.
+      if (mode === 'pvp') {
+        showVersusChoice(menuDiv, options)
+        return
+      }
       menuDiv.style.display = 'none'
       options.onStartGame(mode)
     })
@@ -161,17 +261,22 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   const buttonContainer = document.createElement('div')
   buttonContainer.style.display = 'flex'
   buttonContainer.style.gap = '12px'
-  buttonContainer.style.marginTop = '25px'
+  // Tighter than the gap above the power-up toggle, so the toggle reads as
+  // part of the match setup rather than as one of the utility buttons.
+  buttonContainer.style.marginTop = '18px'
   buttonContainer.style.flexWrap = 'wrap'
   buttonContainer.style.justifyContent = 'center'
 
+  // Fullscreen is offered everywhere except iOS, where Safari only exposes the
+  // Fullscreen API for video/audio elements.
   const buttons = [
     { id: 'settings-button', text: '⚙️ Settings' },
     { id: 'stats-button', text: '📊 Stats' },
     { id: 'achievements-button', text: '🏆 Achievements' },
     { id: 'tutorial-button', text: '📖 How to Play' },
     { id: 'map-selection-button', text: '🗺️ Maps' },
-    ...(currentIsMobile && !isIOS() ? [{ id: 'fullscreen-button', text: '⛶ Fullscreen' }] : []),
+    { id: 'online-button', text: '🌐 Play Online' },
+    ...(isIOS() ? [] : [{ id: 'fullscreen-button', text: '⛶ Fullscreen' }]),
   ]
 
   buttons.forEach(btn => {
@@ -202,6 +307,46 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
     buttonContainer.appendChild(button)
   })
 
+  // Extended Power-Ups quick toggle — the same setting as in the Settings
+  // screen, surfaced here because it changes how a whole match plays.
+  // Appended before the secondary buttons so it sits directly under the game
+  // modes it affects.
+  const powerUpToggleRow = document.createElement('div')
+  powerUpToggleRow.style.display = 'flex'
+  powerUpToggleRow.style.justifyContent = 'center'
+  powerUpToggleRow.style.marginTop = '22px'
+
+  const powerUpToggle = document.createElement('button')
+  powerUpToggle.id = 'extended-powerups-toggle'
+  powerUpToggle.className = 'powerup-toggle'
+  powerUpToggle.title = 'Adds Shield, Pierce, Ghost, Power Bomb and Line Bomb to the drop pool'
+  // The five extra power-ups are shown inline: full colour when enabled,
+  // greyed out when not, so the state is readable without parsing the label.
+  powerUpToggle.innerHTML = `
+    <span class="pt-label">🎲 Extended Power-Ups</span>
+    <span class="pt-icons">🛡️🔥👻☢️🧨</span>
+    <span class="pt-state"></span>
+  `
+  const powerUpState = powerUpToggle.querySelector('.pt-state') as HTMLElement
+
+  const paintPowerUpToggle = (enabled: boolean) => {
+    powerUpToggle.classList.toggle('is-on', enabled)
+    powerUpToggle.classList.toggle('is-off', !enabled)
+    powerUpState.textContent = enabled ? 'ON' : 'OFF'
+    powerUpToggle.setAttribute('aria-pressed', String(enabled))
+  }
+  paintPowerUpToggle(options.getExtendedPowerUps())
+
+  powerUpToggle.addEventListener('click', () => {
+    const next = !options.getExtendedPowerUps()
+    options.onToggleExtendedPowerUps(next)
+    paintPowerUpToggle(next)
+  })
+  // Keep in sync when the setting is changed from the Settings screen instead.
+  ;(menuDiv as any).refreshExtendedPowerUps = () => paintPowerUpToggle(options.getExtendedPowerUps())
+
+  powerUpToggleRow.appendChild(powerUpToggle)
+  menuDiv.appendChild(powerUpToggleRow)
   menuDiv.appendChild(buttonContainer)
   
   // Controls hint removed per user request

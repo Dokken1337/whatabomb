@@ -53,7 +53,7 @@ export function createTutorialScreen(onClose: () => void): HTMLDivElement {
         'Place bombs to destroy blocks and defeat enemies',
         'Bombs explode after 2 seconds in a cross pattern',
         'Chain reactions occur when bombs hit other bombs',
-        'You have 4 lives - avoid explosions and enemies!',
+        'You have 3 lives - avoid explosions and enemies!',
         'Invulnerability lasts 2 seconds after taking damage',
         'This game supports PWAs!',
         'Want to play fullscreen on iOS? Add locally with Share - Add to Homescreen',
@@ -86,20 +86,32 @@ export function createTutorialScreen(onClose: () => void): HTMLDivElement {
       title: '🎯 Game Modes',
       color: '#4ade80',
       items: [
-        '<strong>VS AI:</strong> Defeat 1-3 AI enemies (Best of 3 rounds)',
+        '<strong>VS AI:</strong> Defeat 1-3 AI enemies',
         '<strong>PvP:</strong> Local multiplayer battle',
         '<strong>🌊 Survival:</strong> Endless waves with increasing difficulty',
         '<strong>⏱️ Time Attack:</strong> Beat the clock (bonus time for kills)',
+        'VS AI and PvP are played as a match — set the length in Settings (1 round, best of 3, or best of 5)',
       ]
     },
     {
       title: '🤖 AI Behavior',
       color: '#f472b6',
       items: [
-        'AI enemies hunt you down and place bombs strategically',
-        'They avoid danger zones and collect power-ups',
-        'Difficulty affects AI speed, health, and aggression',
-        'Higher waves in Survival Mode make enemies tougher',
+        'AI enemies path toward you and place bombs strategically',
+        'They avoid danger zones and collect power-ups of their own',
+        'They will blast a tunnel through crates to reach you',
+        'Difficulty affects AI speed, health, aggression and power-up ceiling',
+        'Higher waves in Survival Mode make enemies tougher and faster',
+      ]
+    },
+    {
+      title: '⚙️ Settings Worth Knowing',
+      color: '#60a5fa',
+      items: [
+        '<strong>On-Screen Controls:</strong> AUTO shows the D-pad on touch devices; ON adds it on desktop too',
+        '<strong>Match Length:</strong> 1 round, best of 3, or best of 5',
+        '<strong>Difficulty:</strong> changes AI speed, aggression, power ceiling and enemy health',
+        '<strong>Particle Effects:</strong> turn off for more frames on slower devices',
       ]
     },
     {
