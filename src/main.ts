@@ -1,6 +1,6 @@
 import { FLARE_TEXTURE_DATA_URI } from './assets'
 import './style.css'
-import { isMobile, haptic, setHapticsEnabled, isIOS } from './device'
+import { isMobile, haptic, setHapticsEnabled, isIOS, showOnScreenControls } from './device'
 import {
   ArcRotateCamera,
   Camera,
@@ -8,12 +8,15 @@ import {
   Color4,
   Engine,
   HemisphericLight,
+  Mesh,
   MeshBuilder,
   StandardMaterial,
   Vector3,
   Matrix,
+  Quaternion,
   Scene,
   ParticleSystem,
+  RenderTargetTexture,
   Texture,
   Animation,
   DynamicTexture,
@@ -26,18 +29,25 @@ import { createMainMenu, createPauseMenu, showCountdown, type GameMode } from '.
 
 import { SoundManager } from './sound-manager'
 import { StatisticsManager } from './statistics'
-import { SettingsManager } from './settings'
+import { SettingsManager, sanitizePlayerName } from './settings'
 import { createSettingsMenu } from './settings-menu'
 import { createStatsScreen } from './stats-screen'
 import { GameStateManager } from './game-state'
-import { getDifficultyConfig } from './difficulty'
+import { getDifficultyConfig, getWaveScaling, type DifficultyConfig } from './difficulty'
 import { AchievementsManager } from './achievements'
 import { createAchievementsScreen, showAchievementNotification } from './achievements-screen'
 import { createTutorialScreen } from './tutorial'
 import { createMapSelectionScreen } from './map-selection'
-import { getMapConfig, type MapConfig, type MapTheme } from './maps'
-import { showHitIndicator } from './visual-effects'
-import { shouldAIPlaceBomb, getEscapeDirection, isPositionSafe } from './ai-bomb-logic'
+import { getMapConfig, type MapConfig } from './maps'
+import { showHitIndicator, setParticlesEnabled } from './visual-effects'
+import {
+  shouldAIPlaceBomb,
+  getEscapeDirection,
+  getEscapeDepth,
+  isPositionSafe,
+  findPathToTarget,
+} from './ai-bomb-logic'
+import { generateMap, type SpawnPoint } from './map-gen'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -74,10 +84,6 @@ let GRID_WIDTH = 17
 let GRID_HEIGHT = 17
 const TILE_SIZE = 1
 
-type TileType = 'empty' | 'wall' | 'destructible'
-
-type Grid = TileType[][]
-
 type PowerUpType = 'extraBomb' | 'largerBlast' | 'kick' | 'throw' | 'speed' | 'shield' | 'pierce' | 'ghost' | 'powerBomb' | 'lineBomb'
 
 interface PowerUp {
@@ -97,175 +103,30 @@ interface Bomb {
 }
 
 interface Enemy {
+  /** Stable identifier, also used as the bomb ownerId. Never reused. */
+  id: number
   x: number
   y: number
   mesh: any
   moveTimer: number
   lives: number
+  maxLives: number
   invulnerable: boolean
   invulnerableTimer: number
+  // Per-enemy loadout — previously a parallel array, which made removing a
+  // dead enemy corrupt every other enemy's stats and bomb ownership.
+  maxBombs: number
+  currentBombs: number
+  blastRadius: number
+  /** Current decision interval in ms; shrinks when the AI picks up speed. */
+  moveInterval: number
+  /** Tile the AI is currently trying to tunnel through, if any. */
+  tunnelTarget: { x: number; y: number } | null
   // Smooth movement visual position
   visualX?: number
   visualZ?: number
 }
 
-function createGrid(width: number, height: number, paddingBottom: number = 0, theme: MapTheme = 'classic'): Grid {
-  const grid: Grid = []
-  const totalHeight = height + paddingBottom
-
-  for (let y = 0; y < totalHeight; y++) {
-    const row: TileType[] = []
-    
-    // If we're in the padding area (bottom of map on mobile), just leave empty
-    if (y >= height) {
-      for (let x = 0; x < width; x++) {
-        row.push('empty')
-      }
-      grid.push(row)
-      continue
-    }
-
-    for (let x = 0; x < width; x++) {
-      const isBorder = x === 0 || y === 0 || x === width - 1 || y === height - 1
-      const isInnerPillar = x % 2 === 0 && y % 2 === 0
-
-      if (isBorder) {
-        row.push('wall')
-      } else if (isInnerPillar) {
-        // Theme-specific pillar variations
-        if (theme === 'ice') {
-          // Ice: remove some inner pillars to create open frozen lakes
-          const cx = width / 2, cy = height / 2
-          const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-          row.push(dist < Math.min(width, height) * 0.25 ? 'empty' : 'wall')
-        } else if (theme === 'lava') {
-          // Lava: keep all pillars (tight dangerous corridors)
-          row.push('wall')
-        } else if (theme === 'space' || theme === 'moon') {
-          // Space/Moon: remove alternate pillars for more open feel
-          row.push((x + y) % 4 === 0 ? 'wall' : 'empty')
-        } else {
-          row.push('wall')
-        }
-      } else {
-        // Theme-specific destructible density & extra walls
-        if (theme === 'lava') {
-          // Lava: add "lava channels" - extra walls forming corridors
-          const isChannel = (y % 4 === 1 && x > 3 && x < width - 4 && x % 6 === 0) ||
-                            (x % 4 === 1 && y > 3 && y < height - 4 && y % 6 === 0)
-          if (isChannel) {
-            row.push('wall')
-          } else {
-            row.push(Math.random() < 0.75 ? 'destructible' : 'empty')
-          }
-        } else if (theme === 'ice') {
-          // Ice: less clutter, more open space
-          row.push(Math.random() < 0.6 ? 'destructible' : 'empty')
-        } else if (theme === 'forest') {
-          // Forest: organic clusters - higher density near pillars, clearings elsewhere
-          const nearPillar = (x > 0 && row[x - 1] === 'wall') ||
-                             (y > 0 && grid[y - 1] && grid[y - 1][x] === 'wall')
-          row.push(Math.random() < (nearPillar ? 0.92 : 0.65) ? 'destructible' : 'empty')
-        } else if (theme === 'space' || theme === 'moon') {
-          // Space: rooms and corridors - create open "rooms" with destructible walls between them
-          const inRoom = (x % 5 >= 1 && x % 5 <= 3 && y % 5 >= 1 && y % 5 <= 3)
-          if (inRoom) {
-            row.push(Math.random() < 0.35 ? 'destructible' : 'empty') // Open rooms
-          } else {
-            row.push(Math.random() < 0.85 ? 'destructible' : 'empty') // Dense corridors
-          }
-        } else {
-          // Classic: standard Bomberman density
-          row.push(Math.random() < 0.8 ? 'destructible' : 'empty')
-        }
-      }
-    }
-    grid.push(row)
-  }
-
-  // --- Add theme-specific structural features ---
-  if (theme === 'forest') {
-    // Add some small "clearing" circles
-    const clearings = 2 + Math.floor(Math.random() * 2)
-    for (let c = 0; c < clearings; c++) {
-      const cx = 3 + Math.floor(Math.random() * (width - 6))
-      const cy = 3 + Math.floor(Math.random() * (height - 6))
-      const r = 1.5 + Math.random()
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dx = -2; dx <= 2; dx++) {
-          const nx = cx + dx, ny = cy + dy
-          if (nx > 0 && ny > 0 && nx < width - 1 && ny < height - 1) {
-            if (Math.sqrt(dx * dx + dy * dy) <= r && grid[ny][nx] === 'destructible') {
-              grid[ny][nx] = 'empty'
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (theme === 'moon') {
-    // Add "crater" rings - circular wall patterns
-    const craters = 1 + Math.floor(Math.random() * 2)
-    for (let c = 0; c < craters; c++) {
-      const cx = 4 + Math.floor(Math.random() * (width - 8))
-      const cy = 4 + Math.floor(Math.random() * (height - 8))
-      const r = 2.5
-      for (let dy = -3; dy <= 3; dy++) {
-        for (let dx = -3; dx <= 3; dx++) {
-          const nx = cx + dx, ny = cy + dy
-          if (nx > 0 && ny > 0 && nx < width - 1 && ny < height - 1) {
-            const dist = Math.sqrt(dx * dx + dy * dy)
-            if (dist >= r - 0.5 && dist <= r + 0.5 && !(nx % 2 === 0 && ny % 2 === 0)) {
-              grid[ny][nx] = 'destructible'
-            } else if (dist < r - 0.5) {
-              grid[ny][nx] = 'empty'
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Ensure the top-left corner has some free tiles for player spawn
-  const playerSafeSpots: Array<[number, number]> = [
-    [1, 1],
-    [1, 2],
-    [2, 1],
-  ]
-  for (const [x, y] of playerSafeSpots) {
-    if (grid[y] && grid[y][x]) {
-      grid[y][x] = 'empty'
-    }
-  }
-
-  // Ensure all enemy spawn corners have free tiles
-  const enemySafeSpots: Array<[number, number]> = [
-    // Bottom-right corner (enemy 1)
-    [width - 2, height - 2],
-    [width - 2, height - 3],
-    [width - 3, height - 2],
-    // Bottom-left corner (enemy 2)
-    [1, height - 2],
-    [1, height - 3],
-    [2, height - 2],
-    // Top-right corner (enemy 3)
-    [width - 2, 1],
-    [width - 2, 2],
-    [width - 3, 1],
-    // Bottom-center (enemy 4)
-    [Math.floor(width / 2), height - 2],
-    [Math.floor(width / 2) - 1, height - 2],
-    [Math.floor(width / 2) + 1, height - 2],
-  ]
-  for (const [x, y] of enemySafeSpots) {
-    if (grid[y] && grid[y][x]) {
-      grid[y][x] = 'empty'
-    }
-  }
-
-  return grid
-}
 
 function gridToWorld(x: number, y: number): Vector3 {
   return new Vector3(
@@ -284,6 +145,16 @@ function gridToWorldInPlace(x: number, y: number, out: Vector3): Vector3 {
     (y - GRID_HEIGHT / 2 + 0.5) * TILE_SIZE,
   )
   return out
+}
+
+/** Escape user-supplied text before it goes into an innerHTML template. */
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, ch => (
+    ch === '&' ? '&amp;' :
+    ch === '<' ? '&lt;' :
+    ch === '>' ? '&gt;' :
+    ch === '"' ? '&quot;' : '&#39;'
+  ))
 }
 
 // Helper: set visibility on all child meshes of a TransformNode
@@ -330,7 +201,11 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     soundManager.setMusicVolume(settings.musicVolume)
     soundManager.setSFXVolume(settings.sfxVolume)
   }
-  
+  // The "Particle Effects" toggle previously had no effect at all.
+  setParticlesEnabled(settings.particles)
+  const particlesOn = settings.particles
+  const playerName = sanitizePlayerName(settings.playerName)
+
   // Track game session for achievements
   let sessionEnemiesDefeated = 0
   let sessionBlocksDestroyed = 0
@@ -339,13 +214,28 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   const sessionPowerUpTypes = new Set<string>()
   
   // Get difficulty configuration
-  const difficultyConfig = getDifficultyConfig(settings.difficulty)
-  
-  // Initialize game mode specific state
-  gameStateManager.reset()
+  const difficultyConfig: DifficultyConfig = getDifficultyConfig(settings.difficulty)
+
+  // Initialize game mode specific state.
+  // Round state survives between rounds of the same match, so only the
+  // round-scoped pieces get cleared here.
+  gameStateManager.resetRoundScopedState()
   if (gameMode === 'time-attack') {
     gameStateManager.initTimeAttack(180000, 5000) // 3 minutes, 5 sec bonus per kill
   }
+
+  // Best-of-N matches apply to the versus modes only. Survival and Time Attack
+  // are single continuous runs.
+  const usesRounds = gameMode !== 'survival' && gameMode !== 'time-attack' && settings.rounds > 1
+  if (usesRounds && !gameStateManager.getRoundState()) {
+    gameStateManager.initRounds(settings.rounds)
+  } else if (!usesRounds) {
+    gameStateManager.reset()
+    if (gameMode === 'time-attack') {
+      gameStateManager.initTimeAttack(180000, 5000)
+    }
+  }
+  const roundState = gameStateManager.getRoundState()
 
   // Camera: straight down for flat top-down view
   const maxDimension = Math.max(GRID_WIDTH, GRID_HEIGHT)
@@ -387,7 +277,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     zoomFactor = isLargeMap ? 0.70 : 0.85
   } 
   
-  const margin = TILE_SIZE * 0.4
+  // Breathing room around the arena. Kept tight on desktop so the board claims
+  // as much of the window height as it can — the square arena is height-bound
+  // on a landscape screen, so every unit of margin costs board size.
+  const margin = isMobile() ? TILE_SIZE * 0.4 : TILE_SIZE * 0.12
   // Extra vertical margin for mobile controls - larger margin for larger maps
   const bottomMarginMobile = isLargeMap ? TILE_SIZE * 3.5 : TILE_SIZE * 2.0
 
@@ -401,11 +294,67 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   // Add padding to the camera bottom view
   const bottomPaddingWorld = isMobile() ? (4 * TILE_SIZE) * zoomFactor : 0
 
-  camera.orthoLeft = -viewportHalfWidth
-  camera.orthoRight = viewportHalfWidth
-  // Extend bottom to include controls area without shrinking the game
-  camera.orthoBottom = -viewportHalfHeight - (isMobile() ? bottomMarginMobile * zoomFactor : 0) - bottomPaddingWorld
-  camera.orthoTop = viewportHalfHeight
+  // Vertical extent needed to show the arena plus the mobile control strip
+  const frameTop = viewportHalfHeight
+  const frameBottom = -viewportHalfHeight - (isMobile() ? bottomMarginMobile * zoomFactor : 0) - bottomPaddingWorld
+
+  /**
+   * Fit the arena into the canvas.
+   *
+   * On desktop the ortho box used to be set to fixed world extents regardless
+   * of the window shape, so a square arena came out visibly stretched — wider
+   * than tall on any landscape window, and the distortion changed as the window
+   * was resized. The box is now grown along whichever axis has room to spare,
+   * which keeps tiles square and lets the board claim the full window height.
+   *
+   * Mobile keeps its original framing: that layout is deliberately tuned around
+   * the reserved control strip below the board and the camera-follow clamp.
+   */
+  function applyCameraFraming() {
+    let left = -viewportHalfWidth
+    let right = viewportHalfWidth
+    let top = frameTop
+    let bottom = frameBottom
+
+    if (!isMobile()) {
+      const renderWidth = engine.getRenderWidth() || 1
+      const renderHeight = engine.getRenderHeight() || 1
+      const canvasAspect = renderWidth / renderHeight
+      const contentAspect = (right - left) / (top - bottom)
+
+      if (canvasAspect > contentAspect) {
+        // Extra horizontal room — grow sideways.
+        const centerX = (left + right) / 2
+        const halfWidth = ((top - bottom) * canvasAspect) / 2
+        left = centerX - halfWidth
+        right = centerX + halfWidth
+      } else {
+        // Extra vertical room — grow up and down.
+        const centerY = (top + bottom) / 2
+        const halfHeight = ((right - left) / canvasAspect) / 2
+        top = centerY + halfHeight
+        bottom = centerY - halfHeight
+      }
+    }
+
+    camera.orthoLeft = left
+    camera.orthoRight = right
+    camera.orthoTop = top
+    camera.orthoBottom = bottom
+  }
+
+  applyCameraFraming()
+  // Hook the engine's own resize signal rather than window 'resize'. Babylon
+  // resizes the backbuffer from a ResizeObserver, which fires after the window
+  // event — listening to the window would read a stale canvas size and leave
+  // the arena stretched until the next resize.
+  const framingObserver = engine.onResizeObservable.add(() => {
+    applyCameraFraming()
+    layoutDesktopPanels()
+  })
+  scene.onDisposeObservable.add(() => {
+    engine.onResizeObservable.remove(framingObserver)
+  })
 
   // Fix the camera so the player can't rotate/zoom
   camera.inputs.clear()
@@ -453,13 +402,39 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   dirLight.position = new Vector3(20, 40, 20)
   dirLight.intensity = 0.8
   
-  const shadowGenerator = new ShadowGenerator(1024, dirLight)
+  // Only the static arena casts shadows (characters use their own shadow disc),
+  // so the shadow map is rendered once instead of every frame. It is refreshed
+  // on demand whenever a destructible block is blown up.
+  const lowSpec = isMobile()
+  const shadowGenerator = new ShadowGenerator(lowSpec ? 512 : 1024, dirLight)
   shadowGenerator.useBlurExponentialShadowMap = true
-  shadowGenerator.blurKernel = 32
-  
+  shadowGenerator.blurKernel = lowSpec ? 16 : 32
+  const shadowMap = shadowGenerator.getShadowMap()
+  if (shadowMap) shadowMap.refreshRate = RenderTargetTexture.REFRESHRATE_RENDER_ONCE
+
+  /** Re-render the static shadow map after the arena geometry changes. */
+  function refreshShadows() {
+    const map = shadowGenerator.getShadowMap()
+    if (map) map.refreshRate = RenderTargetTexture.REFRESHRATE_RENDER_ONCE
+  }
+
   // Add Glow Layer for neon effect
-  const glowLayer = new GlowLayer("glow", scene)
+  const glowLayer = new GlowLayer('glow', scene)
   glowLayer.intensity = 0.3
+
+  /**
+   * The glow layer re-renders every mesh in the scene into its own buffer,
+   * roughly doubling the frame's draw calls. A mesh whose material has no
+   * emissive contribution writes pure black into that buffer, so skipping it is
+   * invisible in the result — this excludes exactly those meshes.
+   */
+  function excludeFromGlowIfUnlit(mesh: Mesh) {
+    const mat = mesh.material as StandardMaterial | null
+    if (!mat) return
+    const e = mat.emissiveColor
+    const emits = !!mat.emissiveTexture || (e && (e.r > 0 || e.g > 0 || e.b > 0))
+    if (!emits) glowLayer.addExcludedMesh(mesh)
+  }
 
   // Materials (using map theme colors)
   // Materials (using map theme colors) — only create materials actually used
@@ -470,12 +445,11 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
   // Create map geometry
   const paddingBottom = isMobile() ? 4 : 0
-  const grid = createGrid(GRID_WIDTH, GRID_HEIGHT, paddingBottom, currentMapConfig.theme)
-  
-  // Note: We do NOT update global GRID_HEIGHT here so game logic (spawns/borders) 
+  const generated = generateMap(GRID_WIDTH, GRID_HEIGHT, currentMapConfig.theme, paddingBottom)
+  const grid = generated.grid
+
+  // Note: We do NOT update global GRID_HEIGHT here so game logic (spawns/borders)
   // stays within playable area. Visuals will handle the extra rows.
-  
-  const destructibleMeshes: Map<string, any> = new Map()
 
   // Helper to create a procedural texture
   const createTexture = (color: string, draw: (ctx: CanvasRenderingContext2D) => void) => {
@@ -952,6 +926,74 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   sharedAntennaMat.diffuseColor = new Color3(0.5, 0.5, 0.55)
   sharedAntennaMat.emissiveColor = new Color3(0, 0.1, 0.15)
 
+  // The arena is completely static once built, so every tile/wall/decoration is
+  // collected here and merged into a handful of meshes at the end. A 17x17 map
+  // used to issue ~550 draw calls per frame; merging cuts that to single digits
+  // for the arena without changing how anything looks.
+  const floorLight: Mesh[] = []
+  const floorDark: Mesh[] = []
+  const staticWallMeshes: Mesh[] = []
+
+  // Per-theme crate geometry. The mesh sits at the origin; each crate's
+  // position, tilt and squash live in its own instance matrix.
+  const destructibleShape = (() => {
+    if (theme === 'forest') {
+      return {
+        mesh: MeshBuilder.CreateSphere('crate-template', { diameter: TILE_SIZE * 0.75, segments: 6 }, scene),
+        scaling: new Vector3(1, 0.7, 1),
+        height: TILE_SIZE * 0.3,
+      }
+    }
+    if (theme === 'ice') {
+      return {
+        mesh: MeshBuilder.CreateBox('crate-template', {
+          width: TILE_SIZE * 0.75, height: TILE_SIZE * 0.7, depth: TILE_SIZE * 0.75,
+        }, scene),
+        scaling: new Vector3(1, 1, 1),
+        height: TILE_SIZE * 0.35,
+      }
+    }
+    if (theme === 'lava') {
+      return {
+        mesh: MeshBuilder.CreateBox('crate-template', {
+          width: TILE_SIZE * 0.72, height: TILE_SIZE * 0.65, depth: TILE_SIZE * 0.72,
+        }, scene),
+        scaling: new Vector3(1, 1, 1),
+        height: TILE_SIZE * 0.33,
+      }
+    }
+    if (theme === 'moon') {
+      return {
+        mesh: MeshBuilder.CreateSphere('crate-template', { diameter: TILE_SIZE * 0.7, segments: 5 }, scene),
+        scaling: new Vector3(1, 0.55, 1),
+        height: TILE_SIZE * 0.2,
+      }
+    }
+    // Classic / Space: crate box
+    return {
+      mesh: MeshBuilder.CreateBox('crate-template', { size: TILE_SIZE * 0.8 }, scene),
+      scaling: new Vector3(1, 1, 1),
+      height: TILE_SIZE * 0.4,
+    }
+  })()
+
+  const crateMatrices: Matrix[] = []
+  const crateIndexByTile = new Map<string, number>()
+  const _crateScale = new Vector3()
+  const _crateRotation = new Quaternion()
+  const _cratePosition = new Vector3()
+  const _crateMatrix = new Matrix()
+  /** Collapsing a crate's matrix to zero scale removes it from the field. */
+  const CRATE_REMOVED_MATRIX = Matrix.Scaling(0, 0, 0)
+
+  const decorationsByMaterial = new Map<StandardMaterial, Mesh[]>()
+  const collectDecoration = (mesh: Mesh, material: StandardMaterial) => {
+    mesh.material = material
+    const list = decorationsByMaterial.get(material)
+    if (list) list.push(mesh)
+    else decorationsByMaterial.set(material, [mesh])
+  }
+
   // Create floor tiles individually for better grid visibility
   // Use grid.length to include padding rows
   for (let y = 0; y < grid.length; y++) {
@@ -961,12 +1003,12 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         width: TILE_SIZE * 0.98, // Very small gap
         height: TILE_SIZE * 0.98
       }, scene)
-      
+
       const pos = gridToWorld(x, y)
       tile.position.x = pos.x
       tile.position.z = pos.z
-      tile.receiveShadows = true
       tile.material = isCheckered ? tileMatLight : tileMatDark
+      ;(isCheckered ? floorLight : floorDark).push(tile)
 
       if (grid[y][x] === 'wall') {
         const isBorder = x === 0 || y === 0 || x === GRID_WIDTH - 1 || y === GRID_HEIGHT - 1
@@ -981,7 +1023,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             wall.position.y = TILE_SIZE * 0.5
             wall.position.z = pos.z
             wall.material = wallMaterial
-            shadowGenerator.addShadowCaster(wall)
+            staticWallMeshes.push(wall)
             wall.receiveShadows = true
           } else {
             // Tree trunk
@@ -992,7 +1034,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             trunk.position.y = TILE_SIZE * 0.8
             trunk.position.z = pos.z
             trunk.material = wallMaterial
-            shadowGenerator.addShadowCaster(trunk)
+            staticWallMeshes.push(trunk)
             trunk.receiveShadows = true
             // Tree canopy
             const canopy = MeshBuilder.CreateSphere(`canopy-${x}-${y}`, {
@@ -1002,8 +1044,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             canopy.position.y = TILE_SIZE * 1.55
             canopy.position.z = pos.z
             canopy.scaling = new Vector3(1, 0.7, 1)
-            canopy.material = sharedCanopyMat
-            shadowGenerator.addShadowCaster(canopy)
+            collectDecoration(canopy, sharedCanopyMat)
           }
         } else if (theme === 'ice') {
           // Ice: crystal pillars for inner, frozen wall for borders
@@ -1015,7 +1056,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             wall.position.y = TILE_SIZE * 0.55
             wall.position.z = pos.z
             wall.material = wallMaterial
-            shadowGenerator.addShadowCaster(wall)
+            staticWallMeshes.push(wall)
             wall.receiveShadows = true
           } else {
             // Ice crystal - tapered cylinder
@@ -1028,7 +1069,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             crystal.position.z = pos.z
             crystal.rotation.y = Math.random() * Math.PI
             crystal.material = wallMaterial
-            shadowGenerator.addShadowCaster(crystal)
+            staticWallMeshes.push(crystal)
             crystal.receiveShadows = true
           }
         } else if (theme === 'lava') {
@@ -1045,7 +1086,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             wall.rotation.y = Math.random() * 0.3 - 0.15
           }
           wall.material = wallMaterial
-          shadowGenerator.addShadowCaster(wall)
+          staticWallMeshes.push(wall)
           wall.receiveShadows = true
           // Magma glow at base for inner pillars
           if (!isBorder) {
@@ -1056,7 +1097,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             glow.position.x = pos.x
             glow.position.y = 0.03
             glow.position.z = pos.z
-            glow.material = sharedLavaGlowMat
+            collectDecoration(glow, sharedLavaGlowMat)
           }
         } else if (theme === 'space') {
           // Space: metal panels, taller for inner
@@ -1068,7 +1109,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           wall.position.y = h * 0.5
           wall.position.z = pos.z
           wall.material = wallMaterial
-          shadowGenerator.addShadowCaster(wall)
+          staticWallMeshes.push(wall)
           wall.receiveShadows = true
           // Antenna on some inner pillars
           if (!isBorder && Math.random() < 0.3) {
@@ -1078,7 +1119,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             ant.position.x = pos.x
             ant.position.y = h + TILE_SIZE * 0.25
             ant.position.z = pos.z
-            ant.material = sharedAntennaMat
+            collectDecoration(ant, sharedAntennaMat)
           }
         } else if (theme === 'moon') {
           // Moon: rounded rocks
@@ -1090,7 +1131,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             wall.position.y = TILE_SIZE * 0.5
             wall.position.z = pos.z
             wall.material = wallMaterial
-            shadowGenerator.addShadowCaster(wall)
+            staticWallMeshes.push(wall)
             wall.receiveShadows = true
           } else {
             // Irregular moon rock (stretched sphere)
@@ -1107,7 +1148,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             )
             rock.rotation.y = Math.random() * Math.PI
             rock.material = wallMaterial
-            shadowGenerator.addShadowCaster(rock)
+            staticWallMeshes.push(rock)
             rock.receiveShadows = true
           }
         } else {
@@ -1121,62 +1162,21 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           wall.position.y = TILE_SIZE * 0.6
           wall.position.z = pos.z
           wall.material = wallMaterial
-          shadowGenerator.addShadowCaster(wall)
+          staticWallMeshes.push(wall)
           wall.receiveShadows = true
         }
       } else if (grid[y][x] === 'destructible') {
-        let destructible: any
-        
-        if (theme === 'forest') {
-          // Forest: bush (flattened sphere)
-          destructible = MeshBuilder.CreateSphere(`destructible-${x}-${y}`, {
-            diameter: TILE_SIZE * 0.75, segments: 6
-          }, scene)
-          destructible.scaling = new Vector3(1, 0.7, 1)
-          destructible.position.x = pos.x
-          destructible.position.y = TILE_SIZE * 0.3
-          destructible.position.z = pos.z
-        } else if (theme === 'ice') {
-          // Ice: ice block (box, slightly irregular)
-          destructible = MeshBuilder.CreateBox(`destructible-${x}-${y}`, {
-            width: TILE_SIZE * 0.75, height: TILE_SIZE * 0.7, depth: TILE_SIZE * 0.75
-          }, scene)
-          destructible.position.x = pos.x
-          destructible.position.y = TILE_SIZE * 0.35
-          destructible.position.z = pos.z
-          destructible.rotation.y = Math.random() * 0.3 - 0.15
-        } else if (theme === 'lava') {
-          // Lava: volcanic rock (slightly rounded box)
-          destructible = MeshBuilder.CreateBox(`destructible-${x}-${y}`, {
-            width: TILE_SIZE * 0.72, height: TILE_SIZE * 0.65, depth: TILE_SIZE * 0.72
-          }, scene)
-          destructible.position.x = pos.x
-          destructible.position.y = TILE_SIZE * 0.33
-          destructible.position.z = pos.z
-          destructible.rotation.y = Math.random() * 0.5 - 0.25
-        } else if (theme === 'moon') {
-          // Moon: dust mound (flattened sphere)
-          destructible = MeshBuilder.CreateSphere(`destructible-${x}-${y}`, {
-            diameter: TILE_SIZE * 0.7, segments: 5
-          }, scene)
-          destructible.scaling = new Vector3(1, 0.55, 1)
-          destructible.position.x = pos.x
-          destructible.position.y = TILE_SIZE * 0.2
-          destructible.position.z = pos.z
-        } else {
-          // Classic / Space: crate box
-          destructible = MeshBuilder.CreateBox(`destructible-${x}-${y}`, { 
-            size: TILE_SIZE * 0.8
-          }, scene)
-          destructible.position.x = pos.x
-          destructible.position.y = TILE_SIZE * 0.4
-          destructible.position.z = pos.z
-        }
-        
-        destructible.material = crateMaterial
-        destructibleMeshes.set(`${x},${y}`, destructible)
-        shadowGenerator.addShadowCaster(destructible)
-        destructible.receiveShadows = true
+        // Crates are drawn as thin instances of one template mesh, so the whole
+        // field of ~180 blocks costs a single draw call instead of 180.
+        const jitter = theme === 'ice' ? 0.3 : theme === 'lava' ? 0.5 : 0
+        _crateScale.copyFrom(destructibleShape.scaling)
+        Quaternion.RotationYawPitchRollToRef(
+          jitter ? Math.random() * jitter - jitter / 2 : 0, 0, 0, _crateRotation,
+        )
+        _cratePosition.copyFromFloats(pos.x, destructibleShape.height, pos.z)
+        Matrix.ComposeToRef(_crateScale, _crateRotation, _cratePosition, _crateMatrix)
+        crateIndexByTile.set(`${x},${y}`, crateMatrices.length)
+        crateMatrices.push(_crateMatrix.clone())
       }
     }
   }
@@ -1200,7 +1200,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           mush.position.x = pos.x + (Math.random() - 0.5) * 0.3
           mush.position.y = TILE_SIZE * 0.08
           mush.position.z = pos.z + (Math.random() - 0.5) * 0.3
-          mush.material = Math.random() < 0.5 ? mushMatRed : mushMatYellow
+          collectDecoration(mush, Math.random() < 0.5 ? mushMatRed : mushMatYellow)
         }
       }
     }
@@ -1220,7 +1220,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           pool.position.x = pos.x
           pool.position.y = 0.015
           pool.position.z = pos.z
-          pool.material = poolMat
+          collectDecoration(pool, poolMat)
         }
       }
     }
@@ -1242,7 +1242,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           shard.position.z = pos.z + (Math.random() - 0.5) * 0.3
           shard.rotation.x = (Math.random() - 0.5) * 0.4
           shard.rotation.z = (Math.random() - 0.5) * 0.4
-          shard.material = shardMat
+          collectDecoration(shard, shardMat)
         }
       }
     }
@@ -1264,7 +1264,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           sLight.position.x = pos.x
           sLight.position.y = 0.015
           sLight.position.z = pos.z
-          sLight.material = Math.random() < 0.5 ? slMatCyan : slMatPurple
+          collectDecoration(sLight, Math.random() < 0.5 ? slMatCyan : slMatPurple)
         }
       }
     }
@@ -1283,11 +1283,67 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           pebble.position.y = TILE_SIZE * 0.04
           pebble.position.z = pos.z + (Math.random() - 0.5) * 0.4
           pebble.scaling.y = 0.5
-          pebble.material = pebMat
+          collectDecoration(pebble, pebMat)
         }
       }
     }
   }
+
+  // ── Bake the static arena into a few merged meshes ──
+  // Everything above is fixed for the whole round, so collapsing it by material
+  // trades a one-off build cost for a permanently smaller per-frame draw list.
+  function bakeStatic(meshes: Mesh[], name: string, material: StandardMaterial, receiveShadows: boolean): Mesh | null {
+    if (meshes.length === 0) return null
+    const merged = meshes.length === 1
+      ? meshes[0]
+      : Mesh.MergeMeshes(meshes, true, true, undefined, false, false)
+    if (!merged) return null
+    merged.name = name
+    merged.material = material
+    merged.receiveShadows = receiveShadows
+    merged.isPickable = false
+    merged.doNotSyncBoundingInfo = true
+    merged.freezeWorldMatrix()
+    excludeFromGlowIfUnlit(merged)
+    return merged
+  }
+
+  // Upload the crate field as one instanced batch.
+  const crateBuffer = new Float32Array(crateMatrices.length * 16)
+  crateMatrices.forEach((m, i) => m.copyToArray(crateBuffer, i * 16))
+  destructibleShape.mesh.material = crateMaterial
+  destructibleShape.mesh.receiveShadows = true
+  destructibleShape.mesh.isPickable = false
+  // The arena always fills the view, so skip per-frame culling maths that would
+  // otherwise need the thin-instance bounds recomputed on every destruction.
+  destructibleShape.mesh.alwaysSelectAsActiveMesh = true
+  destructibleShape.mesh.thinInstanceSetBuffer('matrix', crateBuffer, 16, false)
+  shadowGenerator.addShadowCaster(destructibleShape.mesh)
+  excludeFromGlowIfUnlit(destructibleShape.mesh)
+
+  /** Hide the crate on a tile by zeroing its instance matrix. */
+  function removeCrateAt(x: number, y: number): boolean {
+    const index = crateIndexByTile.get(`${x},${y}`)
+    if (index === undefined) return false
+    crateIndexByTile.delete(`${x},${y}`)
+    destructibleShape.mesh.thinInstanceSetMatrixAt(index, CRATE_REMOVED_MATRIX, true)
+    return true
+  }
+
+  bakeStatic(floorLight, 'floor-light', tileMatLight, true)
+  bakeStatic(floorDark, 'floor-dark', tileMatDark, true)
+  const mergedWalls = bakeStatic(staticWallMeshes, 'walls', wallMaterial, true)
+  if (mergedWalls) shadowGenerator.addShadowCaster(mergedWalls)
+
+  decorationsByMaterial.forEach((meshes, material) => {
+    bakeStatic(meshes, `deco-${material.name}`, material, false)
+  })
+
+  // Static materials never change either — freezing skips their dirty checks.
+  ;[tileMatLight, tileMatDark, wallMaterial, crateMaterial].forEach(m => m.freeze())
+  decorationsByMaterial.forEach((_meshes, material) => material.freeze())
+
+  refreshShadows()
 
   // Create player as an animated sprite or emoji fallback
 
@@ -1330,9 +1386,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
     // Shape selection (cat/dog/classic)
     let shape = 'sphere'
-    if (name === 'player') {
-      shape = settingsManager.getSettings().characterShape || 'sphere'
-    } else if (name === 'player-2') {
+    if (name.startsWith('player')) {
+      // Covers both 'player' and 'player2' — the old check looked for
+      // 'player-2', so Player 2 never picked up the chosen character shape.
       shape = settingsManager.getSettings().characterShape || 'sphere'
     } else if (name.includes('enemy')) {
       shape = ['sphere', 'cat', 'dog'][Math.floor(Math.random() * 3)]
@@ -1693,6 +1749,13 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       whiteMat.dispose(); shoeMat.dispose(); accentMat.dispose()
     })
 
+    // Bodies, limbs and clothing are unlit; only the eyes glow. Skipping the
+    // rest in the glow pass is a no-op visually but removes ~30 draw calls per
+    // character every frame.
+    for (const child of root.getChildMeshes()) {
+      excludeFromGlowIfUnlit(child as Mesh)
+    }
+
     ;(root as any).playAnimation = (anim: string) => {
       if (anim.startsWith('walk')) {
         isMoving = true
@@ -1717,8 +1780,8 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
   const player = createPlayerSprite('player', null, '🧑', settings.player1Color)
   ;(player as any)._cachedChildMeshes = player.getChildMeshes()
-  let playerGridX = 1
-  let playerGridY = 1
+  let playerGridX = generated.playerSpawn.x
+  let playerGridY = generated.playerSpawn.y
   const playerPos = gridToWorld(playerGridX, playerGridY)
   player.position.x = playerPos.x
   player.position.y = TILE_SIZE * 0.5
@@ -1760,32 +1823,39 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   let survivalWave = 1
   let survivalScore = 0
 
-  // Enemy spawn positions
-  const enemySpawns = [
-    { x: GRID_WIDTH - 2, y: GRID_HEIGHT - 2 }, // Bottom-right
-    { x: 1, y: GRID_HEIGHT - 2 },              // Bottom-left
-    { x: GRID_WIDTH - 2, y: 1 },               // Top-right
-    { x: GRID_WIDTH / 2, y: GRID_HEIGHT - 2 }, // Bottom-center
-  ]
+  // Enemy spawn positions (validated by the map generator, so no fractional
+  // coordinates and always inside a carved-out safe corner)
+  const enemySpawns: SpawnPoint[] = generated.enemySpawns
 
   // Create enemies
   const enemies: Enemy[] = []
   const enemyEmojis = ['👾', '👹', '👺']
   // White, Brown, Dark Red - distinct from player settings
-  const enemyColors = ['#ffffff', '#8d6e63', '#b91c1c'] 
+  const enemyColors = ['#ffffff', '#8d6e63', '#b91c1c']
 
-  for (let i = 0; i < numEnemies; i++) {
-    const spawn = enemySpawns[i]
-    const enemyMesh = createPlayerSprite(`enemy-${i}`, null, enemyEmojis[i % 3], enemyColors[i % 3])
+  let nextEnemyId = 0
+
+  /** Build an enemy with the loadout its difficulty (and wave) calls for. */
+  function spawnEnemy(spawn: SpawnPoint, wave: number): Enemy {
+    const id = nextEnemyId++
+    const scaling = getWaveScaling(difficultyConfig, wave)
+    const enemyMesh = createPlayerSprite(`enemy-${id}`, null, enemyEmojis[id % 3], enemyColors[id % 3])
     const enemyPos = gridToWorld(spawn.x, spawn.y)
     const enemy: Enemy = {
+      id,
       x: spawn.x,
       y: spawn.y,
       mesh: enemyMesh,
       moveTimer: Math.random() * 400, // Stagger movement
-      lives: difficultyConfig.enemyStartingLives,
+      lives: scaling.lives,
+      maxLives: scaling.lives,
       invulnerable: false,
       invulnerableTimer: 0,
+      maxBombs: scaling.maxBombs,
+      currentBombs: 0,
+      blastRadius: scaling.blastRadius,
+      moveInterval: scaling.moveSpeed,
+      tunnelTarget: null,
       visualX: enemyPos.x,
       visualZ: enemyPos.z,
     }
@@ -1793,13 +1863,32 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     enemy.mesh.position.y = TILE_SIZE * 0.5
     enemy.mesh.position.z = enemyPos.z
     ;(enemy.mesh as any)._cachedChildMeshes = enemy.mesh.getChildMeshes()
-    enemies.push(enemy)
+    return enemy
+  }
+
+  for (let i = 0; i < numEnemies; i++) {
+    enemies.push(spawnEnemy(enemySpawns[i % enemySpawns.length], 1))
+  }
+
+  /** Look up an enemy by its stable id (bombs store this as ownerId). */
+  function findEnemyById(id: number): Enemy | undefined {
+    return enemies.find(e => e.id === id)
+  }
+
+  /**
+   * Drop defeated enemies from the list. Safe now that stats live on the enemy
+   * object instead of a parallel array indexed by position.
+   */
+  function pruneDeadEnemies() {
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      if (enemies[i].lives <= 0) enemies.splice(i, 1)
+    }
   }
 
   // Player 2 for PvP mode
-  let player2GridX = GRID_WIDTH - 2
-  let player2GridY = GRID_HEIGHT - 2
-  let player2Lives = 4
+  let player2GridX = enemySpawns[0].x
+  let player2GridY = enemySpawns[0].y
+  let player2Lives = difficultyConfig.playerStartingLives
   let player2Invulnerable = false
   let player2InvulnerableTimer = 0
   let player2MaxBombs = 1
@@ -1841,6 +1930,8 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   const powerUps: PowerUp[] = []
   let gameOver = false
   let gameWon = false
+  /** Guards against the round result being counted twice by repeated updateUI calls. */
+  let roundScored = false
   
   // Chain reaction tracking
   let chainReactionCount = 0
@@ -1851,18 +1942,14 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     if (chainReactionTimer) { clearTimeout(chainReactionTimer); chainReactionTimer = null }
   })
 
-  // Enemy stats (for AI) - each enemy has their own stats
-  const enemyStats = enemies.map(() => ({
-    maxBombs: 1,
-    currentBombs: 0,
-    blastRadius: 2,
-  }))
-
   // UI for player (top-left) - positioned at bottom for mobile
   const isMobileDevice = isMobile()
-  
-  // Create pause button for mobile
-  if (isMobileDevice) {
+  const useOnScreenControls = showOnScreenControls(settings.onScreenControls)
+
+  // The pause button is always available — it is the only way to pause on a
+  // touch device, and on desktop it stays as a visible alternative to Escape
+  // regardless of the on-screen-controls setting.
+  {
     const pauseBtn = document.createElement('div')
     pauseBtn.innerHTML = '⏸️'
     pauseBtn.style.position = 'absolute'
@@ -1871,8 +1958,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     pauseBtn.style.left = 'auto'
     pauseBtn.style.width = '44px'
     pauseBtn.style.height = '44px'
-    pauseBtn.id = "mobile-pause-btn"
-    pauseBtn.className = "mobile-pause-btn"
+    pauseBtn.id = "game-pause-btn"
+    pauseBtn.className = "game-pause-btn"
+    pauseBtn.title = 'Pause (Esc)'
     pauseBtn.style.background = 'rgba(0,0,0,0.5)'
     pauseBtn.style.border = '2px solid rgba(255,255,255,0.3)'
     pauseBtn.style.borderRadius = '8px'
@@ -1906,10 +1994,19 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     playerUIDiv.style.transform = 'translateX(-50%) scale(0.55)'
     playerUIDiv.style.transformOrigin = 'center bottom'
   } else {
-    // PC: Centered at bottom with transparency
-    playerUIDiv.style.bottom = '15px'
-    playerUIDiv.style.left = '50%'
-    playerUIDiv.style.transform = 'translateX(-50%)'
+    // PC: the arena is square, so a landscape window always leaves a gutter on
+    // each side. Park the HUD there instead of over the board — it uses the
+    // otherwise-dead space and stops the panel covering the bottom rows.
+    // Exact placement is done by layoutDesktopPanels() once the board size and
+    // the panel's rendered width are known.
+    playerUIDiv.style.top = '50%'
+    playerUIDiv.style.left = '12px'
+    playerUIDiv.style.transformOrigin = 'left center'
+    playerUIDiv.style.transform = 'translateY(-50%)'
+    // Cap the width so the power-up icons wrap onto extra rows. Without this,
+    // the ten Extended Power-Up icons make one very wide panel that the gutter
+    // fit then has to shrink to an unreadable size.
+    playerUIDiv.style.maxWidth = '210px'
   }
   playerUIDiv.style.color = 'white'
   playerUIDiv.style.fontFamily = "'Russo One', sans-serif"
@@ -1966,6 +2063,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   centerUIDiv.style.borderRadius = '12px'
   centerUIDiv.style.padding = isMobileDevice ? '6px 14px' : '8px 16px'
   centerUIDiv.style.boxShadow = '0 0 20px rgba(255, 102, 0, 0.3), inset 0 1px 0 rgba(255,255,255,0.1)'
+  // Keep the compact scoreboard on one line instead of wrapping into a block
+  // that covers the top rows of the board.
+  centerUIDiv.style.whiteSpace = 'nowrap'
   document.body.appendChild(centerUIDiv)
 
   // UI for opponents (top-right on PC, hidden on mobile)
@@ -1976,9 +2076,12 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       // Hide opponent stats on mobile - controls take up the space
       opponentUIDiv.style.display = 'none'
   } else {
-      // PC: Top right but semi-transparent
-      opponentUIDiv.style.top = '10px'
-      opponentUIDiv.style.right = '10px'
+      // PC: mirrored into the right-hand gutter, opposite the player panel
+      opponentUIDiv.style.top = '50%'
+      opponentUIDiv.style.right = '12px'
+      opponentUIDiv.style.transformOrigin = 'right center'
+      opponentUIDiv.style.transform = 'translateY(-50%)'
+      opponentUIDiv.style.maxWidth = '210px'
   }
   opponentUIDiv.style.color = 'white'
   opponentUIDiv.style.fontFamily = "'Russo One', sans-serif"
@@ -2008,10 +2111,62 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   }
   document.body.appendChild(opponentUIDiv)
 
+  /**
+   * Tuck the desktop HUD into the empty columns beside the square arena.
+   *
+   * The board is height-bound on any landscape window, so the leftover width is
+   * split evenly on either side. Each panel is pinned just outside the board
+   * edge and, when the gutter is narrower than the panel, scaled down to fit
+   * rather than being allowed to cover the playfield.
+   */
+  let lastPanelLayoutKey = ''
+  function layoutDesktopPanels() {
+    if (isMobileDevice) return
+
+    const unitsPerPx = (camera.orthoTop! - camera.orthoBottom!) / (engine.getRenderHeight() || 1)
+    const boardPx = (GRID_WIDTH * TILE_SIZE) / unitsPerPx
+    const gutter = (engine.getRenderWidth() - boardPx) / 2
+
+    const place = (el: HTMLDivElement, side: 'left' | 'right') => {
+      if (el.style.display === 'none') return
+      // Measure at natural size, then scale only if the gutter is too tight.
+      el.style.transform = `translateY(-50%)`
+      const width = el.offsetWidth
+      if (!width) return
+      const available = gutter - 16
+      const scale = Math.min(1, Math.max(0.6, available / width))
+      const inset = Math.max(8, gutter - width * scale - 12)
+      el.style[side] = `${Math.round(inset)}px`
+      el.style.transform = `translateY(-50%) scale(${scale.toFixed(3)})`
+    }
+
+    const key = `${engine.getRenderWidth()}x${engine.getRenderHeight()}|${playerUIDiv.innerHTML.length}|${opponentUIDiv.innerHTML.length}`
+    if (key === lastPanelLayoutKey) return
+    lastPanelLayoutKey = key
+
+    place(playerUIDiv, 'left')
+    place(opponentUIDiv, 'right')
+  }
+
   // Mobile controls are created later (after keysHeld is defined) to properly
   // interact with the game's input system rather than dispatching synthetic KeyboardEvents.
 
+  // updateUI() rewrites the innerHTML of three panels. A single explosion could
+  // call it a dozen times in one frame (per enemy hit, per power-up), so calls
+  // are coalesced and flushed once per frame instead.
+  let uiDirty = true
   function updateUI() {
+    uiDirty = true
+  }
+
+  function flushUI() {
+    if (!uiDirty) return
+    uiDirty = false
+    renderUI()
+    layoutDesktopPanels()
+  }
+
+  function renderUI() {
     // Update center UI (timer)
     const timeAttackState = gameStateManager.getTimeAttackState()
     
@@ -2029,6 +2184,24 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       centerUIDiv.innerHTML = `
         <div style="color: ${timeColor}; font-size: ${isLowTime ? '20px' : '18px'}; ${isLowTime ? 'animation: pulse 0.5s infinite;' : ''}">⏱️ ${timeString}</div>
         <div style="font-size: 11px; margin-top: 8px; color: #aaa;">Defeated: <span style="color: #ff6600;">${timeAttackState.enemiesDefeated}</span></div>
+      `
+    } else if (roundState) {
+      // Best-of-N scoreboard — this panel used to be dead weight outside of
+      // Time Attack because the round system was never initialised.
+      // Single compact line on every screen size. The board fills nearly the
+      // whole window height on desktop, so a multi-line panel here sat right on
+      // top of the playfield.
+      const opponentLabel = gameMode === 'pvp' ? 'P2' : 'AI'
+      centerUIDiv.style.display = 'block'
+      centerUIDiv.classList.add('center-ui-slim')
+      centerUIDiv.innerHTML = `
+        <span style="color: #ffaa00;">R${roundState.currentRound}</span>
+        <span style="color: #555;"> · </span>
+        <span style="color: ${settings.player1Color};">${escapeHtml(playerName)} ${roundState.playerWins}</span>
+        <span style="color: #888;">-</span>
+        <span style="color: #cc44ff;">${roundState.enemyWins} ${opponentLabel}</span>
+        <span style="color: #555;"> · </span>
+        <span style="color: #888;">TO ${gameStateManager.getWinsNeeded()}</span>
       `
     } else {
       centerUIDiv.style.display = 'none'
@@ -2098,7 +2271,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     }
 
     playerUIDiv.innerHTML = `
-      <div style="font-size: 12px; margin-bottom: 8px; color: ${settings.player1Color}; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px ${settings.player1Color}88;">Player 1</div>
+      <div style="font-size: 12px; margin-bottom: 8px; color: ${settings.player1Color}; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px ${settings.player1Color}88;">${escapeHtml(playerName)}</div>
       <div style="display: flex; align-items: center; gap: 8px;">
         <span style="font-size: 18px;">❤️</span>
         <span style="font-size: 14px; font-weight: bold;">${playerLives}/${difficultyConfig.playerStartingLives}</span>
@@ -2113,9 +2286,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         <div style="font-size: 12px; margin-bottom: 8px; color: ${settings.player2Color}; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px ${settings.player2Color}88;">Player 2</div>
         <div style="display: flex; align-items: center; gap: 8px;">
           <span style="font-size: 18px;">❤️</span>
-          <span style="font-size: 14px; font-weight: bold;">${player2Lives}/4</span>
+          <span style="font-size: 14px; font-weight: bold;">${player2Lives}/${difficultyConfig.playerStartingLives}</span>
         </div>
-        ${healthBarHTML(player2Lives, 4, true)}
+        ${healthBarHTML(player2Lives, difficultyConfig.playerStartingLives, true)}
         ${powerupIconsHTML(player2MaxBombs, player2BlastRadius, player2HasKick, player2HasThrow, player2Speed, player2ShieldCharges, player2HasPierce, player2GhostTimer, player2PowerBombCharges, player2HasLineBomb)}
       `
     } else {
@@ -2127,18 +2300,17 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         enemiesHTML += `<div style="color: #4CAF50; font-size: 14px;">All defeated! 🎉</div>`
       } else {
         aliveEnemies.forEach((enemy, i) => {
-          const idx = enemies.indexOf(enemy)
           enemiesHTML += `
             <div style="margin-bottom: 8px; ${i > 0 ? 'border-top: 1px solid rgba(255,255,255,0.1); padding-top: 8px;' : ''}">
               <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
-                <span style="font-size: 14px;">${['👾', '👹', '👺'][idx % 3]}</span>
-                <span style="font-size: 12px; color: #aaa;">AI ${idx + 1}</span>
-                <span style="font-size: 11px; color: #888; margin-left: auto;">💣${enemyStats[idx].maxBombs} ⚡${enemyStats[idx].blastRadius}</span>
+                <span style="font-size: 14px;">${enemyEmojis[enemy.id % 3]}</span>
+                <span style="font-size: 12px; color: #aaa;">AI ${enemy.id + 1}</span>
+                <span style="font-size: 11px; color: #888; margin-left: auto;">💣${enemy.maxBombs} ⚡${enemy.blastRadius}</span>
               </div>
               <div style="display: flex; align-items: center; gap: 6px;">
                 <span style="font-size: 12px;">❤️ ${enemy.lives}</span>
                 <div style="flex: 1; height: 8px; background: #222; border-radius: 4px; overflow: hidden;">
-                  <div style="width: ${(enemy.lives / difficultyConfig.enemyStartingLives) * 100}%; height: 100%; background: linear-gradient(90deg, #cc44ff, #9933cc); border-radius: 4px;"></div>
+                  <div style="width: ${(enemy.lives / enemy.maxLives) * 100}%; height: 100%; background: linear-gradient(90deg, #cc44ff, #9933cc); border-radius: 4px;"></div>
                 </div>
               </div>
             </div>
@@ -2156,6 +2328,17 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       // Create a winner overlay instead of appending to playerUI
       const existingOverlay = document.getElementById('game-over-overlay')
       if (!existingOverlay) {
+        // Score the round before drawing the overlay so the text can report
+        // either "round won" or the final match result.
+        let matchOver = true
+        if (roundState && !roundScored) {
+          roundScored = true
+          if (gameWon) gameStateManager.recordPlayerRoundWin()
+          else gameStateManager.recordEnemyRoundWin()
+          matchOver = gameStateManager.isMatchOver()
+          if (!matchOver) gameStateManager.nextRound()
+        }
+
         const overlay = document.createElement('div')
         overlay.id = 'game-over-overlay'
         overlay.className = 'winner-overlay'
@@ -2182,14 +2365,21 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         let winColor = gameWon ? '#4CAF50' : '#f44336'
         let titleText = gameWon ? '🎉 VICTORY! 🎉' : '💀 GAME OVER 💀'
         let shadowColor = gameWon ? '#388E3C' : '#c62828'
-        
+
         if (gameMode === 'pvp') {
           winColor = gameWon ? settings.player1Color : settings.player2Color
-          titleText = gameWon ? '🏆 PLAYER 1 WINS! 🏆' : '🏆 PLAYER 2 WINS! 🏆'
+          titleText = gameWon ? `🏆 ${playerName.toUpperCase()} WINS! 🏆` : '🏆 PLAYER 2 WINS! 🏆'
           shadowColor = winColor
-          
+
           // Force victory style for both players in PvP
           winnerText.className = 'winner-text victory'
+        }
+
+        if (roundState && !matchOver) {
+          titleText = gameWon ? '✔️ ROUND WON!' : '✖️ ROUND LOST'
+          winnerText.className = `winner-text ${gameWon ? 'victory' : 'defeat'}`
+        } else if (roundState) {
+          titleText = gameWon ? '🏆 MATCH WON! 🏆' : '💀 MATCH LOST 💀'
         }
 
         winnerText.style.color = winColor
@@ -2197,7 +2387,21 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         winnerText.style.animation = 'winnerPulse 1s ease-in-out infinite'
         winnerText.textContent = titleText
         overlay.appendChild(winnerText)
-        
+
+        // Match scoreboard
+        if (roundState) {
+          const scoreDiv = document.createElement('div')
+          scoreDiv.style.fontSize = '22px'
+          scoreDiv.style.marginBottom = '10px'
+          scoreDiv.style.fontFamily = "'Russo One', sans-serif"
+          const opponentLabel = gameMode === 'pvp' ? 'Player 2' : 'AI'
+          scoreDiv.innerHTML =
+            `<span style="color:${settings.player1Color}">${escapeHtml(playerName)} ${roundState.playerWins}</span>` +
+            `<span style="color:#888"> — </span>` +
+            `<span style="color:#cc44ff">${roundState.enemyWins} ${opponentLabel}</span>`
+          overlay.appendChild(scoreDiv)
+        }
+
         // Survival/Time Attack stats
         if (gameMode === 'survival') {
           const statsDiv = document.createElement('div')
@@ -2228,9 +2432,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           btn.addEventListener('touchend', () => btn.style.transform = '', { passive: true })
         }
 
-        // Restart button
+        // Restart button — continues the match when rounds are still to play
         const restartBtn = document.createElement('button')
-        restartBtn.innerHTML = '🔄 Play Again'
+        restartBtn.innerHTML = roundState && !matchOver ? '▶️ Next Round' : '🔄 Play Again'
         restartBtn.style.fontSize = isMobileDevice ? '20px' : '18px'
         restartBtn.style.padding = isMobileDevice ? '18px 50px' : '15px 35px'
         restartBtn.style.cursor = 'pointer'
@@ -2258,7 +2462,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           opponentUIDiv.remove()
           centerUIDiv.remove()
           // Clean up mobile controls and indicators (match "Main Menu" cleanup)
-          document.querySelectorAll('.mobile-controls-container, .mobile-controls-wrapper, .mobile-pause-btn, .offscreen-indicator, #indicator-container').forEach(el => el.remove())
+          document.querySelectorAll('.mobile-controls-container, .mobile-controls-wrapper, .game-pause-btn, .offscreen-indicator, #indicator-container').forEach(el => el.remove())
+          // A finished match starts a fresh scoreboard; an unfinished one carries on.
+          if (matchOver) gameStateManager.reset()
           startGame(gameMode)
         })
         buttonContainer.appendChild(restartBtn)
@@ -2293,7 +2499,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           opponentUIDiv.remove()
           centerUIDiv.remove()
           mainMenu.style.display = 'flex'
-          
+          gameStateManager.reset() // abandoning the match clears the scoreboard
+          if (soundManager) soundManager.stopMusic()
+
           // Dispose scene first, then engine (correct order for GPU resource cleanup)
           if (currentScene) {
             currentScene.dispose()
@@ -2313,7 +2521,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           // Explicitly remove mobile controls
           document.querySelectorAll('.mobile-controls-wrapper').forEach(el => el.remove())
           document.querySelectorAll('.mobile-controls-container').forEach(el => el.remove())
-          document.querySelectorAll('.mobile-pause-btn').forEach(el => el.remove())
+          document.querySelectorAll('.game-pause-btn').forEach(el => el.remove())
         })
         buttonContainer.appendChild(menuBtn)
         
@@ -2340,7 +2548,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       }
     }
   }
-  updateUI()
+  renderUI()
 
   // Helper function to check if tile blocks explosions
   function blocksExplosion(x: number, y: number): boolean {
@@ -2797,11 +3005,18 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       }
     }
 
+    // A fully upgraded bomb covers 20+ tiles, and the old code spawned two
+    // particle systems per tile. Emitters are limited to the centre plus a few
+    // spread-out tiles, which looks the same but costs a fraction as much.
+    const maxEmitters = particlesOn ? (lowSpec ? 3 : 6) : 0
+    const emitterStride = Math.max(1, Math.ceil(explosionTiles.length / Math.max(1, maxEmitters)))
+
     // Create explosion visuals with animation
     const explosionMeshes: any[] = []
     for (let idx = 0; idx < explosionTiles.length; idx++) {
       const [x, y] = explosionTiles[idx]
       const isCenter = idx === 0
+      const emitsParticles = maxEmitters > 0 && (isCenter || idx % emitterStride === 0)
 
       // ── Core fireball ──
       const fireball = MeshBuilder.CreateSphere('exp-fire', {
@@ -2829,11 +3044,15 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       scorch.material = sharedScorchMat
       explosionMeshes.push(scorch)
 
-      // Create fire particle effect
-      createExplosionParticles(x, y)
+      if (emitsParticles) {
+        // Create fire particle effect
+        createExplosionParticles(x, y)
 
-      // Add smoke after fire (slightly later so smoke is visible after fireball fades)
-      setTimeout(() => createSmokeParticles(x, y), 150)
+        // Add smoke after fire (slightly later so smoke is visible after fireball fades)
+        setTimeout(() => {
+          if (!scene.isDisposed) createSmokeParticles(x, y)
+        }, 150)
+      }
 
       // Staggered timing for directional tiles (ripple outward)
       const delay = idx === 0 ? 0 : idx * 0.8
@@ -2890,11 +3109,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       // Destroy destructible blocks
       if (grid[y][x] === 'destructible') {
         grid[y][x] = 'empty'
-        const key = `${x},${y}`
-        const destructibleMesh = destructibleMeshes.get(key)
-        if (destructibleMesh) {
-          destructibleMesh.dispose()
-          destructibleMeshes.delete(key)
+        if (removeCrateAt(x, y)) {
+          // The shadow map is rendered on demand rather than every frame, so it
+          // has to be told the arena geometry just changed.
+          refreshShadows()
         }
         statsManager.recordBlockDestroyed()
         sessionBlocksDestroyed++
@@ -3028,22 +3246,23 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         } // end of shield else
       }
 
-      // Check if any enemy is hit
-      enemies.forEach((enemy, idx) => {
+      // Check if any enemy is hit. Iterate over a snapshot: survival waves push
+      // new enemies into the array from inside this loop.
+      enemies.slice().forEach((enemy) => {
         if (x === enemy.x && y === enemy.y && !enemy.invulnerable && enemy.lives > 0) {
           enemy.lives--
           enemy.invulnerable = true
           enemy.invulnerableTimer = 2000
-          
+
           // Show hit indicator
           const enemyPos = gridToWorld(enemy.x, enemy.y)
           showHitIndicator(enemyPos, scene, false)
-          
-          console.log(`Enemy ${idx + 1} hit! Lives remaining:`, enemy.lives)
-          
+
+          console.log(`Enemy ${enemy.id + 1} hit! Lives remaining:`, enemy.lives)
+
           if (enemy.lives <= 0) {
             enemy.mesh.dispose()
-            console.log(`Enemy ${idx + 1} destroyed!`)
+            console.log(`Enemy ${enemy.id + 1} destroyed!`)
             statsManager.recordEnemyDefeated()
             sessionEnemiesDefeated++
             
@@ -3062,42 +3281,17 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
             const allEnemiesDead = enemies.every(e => e.lives <= 0)
             if (allEnemiesDead && gameMode !== 'pvp') {
               if (gameMode === 'survival') {
-                // Spawn next wave
+                // Spawn next wave. Corpses are dropped from the array first —
+                // they used to accumulate forever, growing every per-frame loop.
                 survivalWave++
                 survivalScore += 100 * survivalWave
                 const enemiesToSpawn = Math.min(survivalWave, 4) // Max 4 enemies
-                
+                pruneDeadEnemies()
+
                 for (let i = 0; i < enemiesToSpawn; i++) {
-                  const spawn = enemySpawns[i % enemySpawns.length]
-                  // Use same distinct colors for survival waves
-                  const enemyColors = ['#ffffff', '#8d6e63', '#b91c1c']
-                  const enemyMesh = createPlayerSprite(`enemy-wave${survivalWave}-${i}`, null, enemyEmojis[i % 3], enemyColors[i % 3])
-                  const enemyPos = gridToWorld(spawn.x, spawn.y)
-                  const enemy: Enemy = {
-                    x: spawn.x,
-                    y: spawn.y,
-                    mesh: enemyMesh,
-                    moveTimer: Math.random() * 400,
-                    lives: difficultyConfig.enemyStartingLives + Math.floor(survivalWave / 3), // Increase health every 3 waves
-                    invulnerable: false,
-                    invulnerableTimer: 0,
-                    visualX: enemyPos.x,
-                    visualZ: enemyPos.z,
-                  }
-                  enemy.mesh.position.x = enemyPos.x
-                  enemy.mesh.position.y = TILE_SIZE * 0.5
-                  enemy.mesh.position.z = enemyPos.z
-                  ;(enemy.mesh as any)._cachedChildMeshes = enemy.mesh.getChildMeshes()
-                  enemies.push(enemy)
-                  
-                  // Add stats for new enemy
-                  enemyStats.push({
-                    maxBombs: 1,
-                    currentBombs: 0,
-                    blastRadius: 2,
-                  })
+                  enemies.push(spawnEnemy(enemySpawns[i % enemySpawns.length], survivalWave))
                 }
-                
+
                 console.log(`Wave ${survivalWave} incoming! ${enemiesToSpawn} enemies!`)
                 if (soundManager) soundManager.playSFX('powerup')
                 
@@ -3334,8 +3528,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           currentBombs--
         } else if (bomb.ownerId === -2) {
           player2CurrentBombs--
-        } else if (bomb.ownerId !== undefined && bomb.ownerId >= 0 && enemyStats[bomb.ownerId]) {
-          enemyStats[bomb.ownerId].currentBombs--
+        } else if (bomb.ownerId !== undefined && bomb.ownerId >= 0) {
+          const owner = findEnemyById(bomb.ownerId)
+          if (owner) owner.currentBombs = Math.max(0, owner.currentBombs - 1)
         }
         
         bombs.splice(i, 1)
@@ -3369,10 +3564,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
     // Enemies
     enemies.forEach(enemy => {
-      if (enemy.invulnerable) {
+      if (enemy.invulnerable && enemy.lives > 0) {
         enemy.invulnerableTimer -= deltaTime
         setCharacterVisibility(enemy.mesh, Math.sin(Date.now() / 100) > 0 ? 0.5 : 1)
-        
+
         if (enemy.invulnerableTimer <= 0) {
           enemy.invulnerable = false
           setCharacterVisibility(enemy.mesh, 1)
@@ -3402,257 +3597,220 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     }
   }
 
+  /** Direction offsets shared by every AI scan. */
+  const DIRECTION_STEPS: Array<[number, number]> = [[0, 1], [0, -1], [1, 0], [-1, 0]]
+
+  /**
+   * Who this AI is hunting. Outside PvP that is always Player 1; with a second
+   * player present it picks whoever is closer.
+   */
+  function pickAITarget(enemy: Enemy): { x: number; y: number } | null {
+    const p1 = { x: playerGridX, y: playerGridY }
+    if (gameMode !== 'pvp' || player2Lives <= 0) return playerLives > 0 ? p1 : null
+    const p2 = { x: player2GridX, y: player2GridY }
+    if (playerLives <= 0) return p2
+    const d1 = Math.abs(enemy.x - p1.x) + Math.abs(enemy.y - p1.y)
+    const d2 = Math.abs(enemy.x - p2.x) + Math.abs(enemy.y - p2.y)
+    return d1 <= d2 ? p1 : p2
+  }
+
+  /** Escape route assuming the AI drops a bomb on its current tile. */
+  function getEscapeDirectionForBomb(
+    enemy: Enemy,
+    bombData: Array<{ x: number; y: number; blastRadius: number }>,
+    depth: number,
+    blocked: Array<{ x: number; y: number }>,
+  ) {
+    return getEscapeDirection(
+      enemy.x, enemy.y, grid, GRID_WIDTH, GRID_HEIGHT,
+      [...bombData, { x: enemy.x, y: enemy.y, blastRadius: enemy.blastRadius }],
+      depth, blocked,
+    )
+  }
+
   // Smart AI for enemies
   function updateEnemies(deltaTime: number) {
     if (gameOver) return
 
-    enemies.forEach((enemy, enemyIdx) => {
-      if (enemy.lives <= 0) return
+    // Snapshot the bomb list once per frame rather than once per enemy.
+    const bombData = bombs.map(b => ({ x: b.x, y: b.y, blastRadius: b.blastRadius }))
+
+    for (const enemy of enemies) {
+      if (enemy.lives <= 0) continue
 
       enemy.moveTimer -= deltaTime
-      if (enemy.moveTimer <= 0) {
-        enemy.moveTimer = difficultyConfig.aiMoveSpeed
+      if (enemy.moveTimer > 0) continue
+      // Difficulty (and Survival waves) drive this interval. It used to be a
+      // flat 600-1000ms against a player who moves every 150ms, which is why
+      // every difficulty felt the same and none of them felt threatening.
+      enemy.moveTimer = enemy.moveInterval
 
-        const directions = [
-          [0, 1],
-          [0, -1],
-          [1, 0],
-          [-1, 0],
-        ]
-        
-        // Get bomb data for AI calculations
-        const bombData = bombs.map(b => ({ x: b.x, y: b.y, blastRadius: b.blastRadius }))
-        
-        // PRIORITY 1: If in danger, ESCAPE is the ONLY priority!
-        const currentlyInDanger = !isPositionSafe(enemy.x, enemy.y, grid, bombData)
-        
-        if (currentlyInDanger) {
-          // Use BFS to find the best escape direction
-          const escapeDir = getEscapeDirection(enemy.x, enemy.y, grid, GRID_WIDTH, GRID_HEIGHT, bombData)
-          
-          if (escapeDir) {
-            const newX = enemy.x + escapeDir.dx
-            const newY = enemy.y + escapeDir.dy
-            
-            // Verify the move is actually valid (double-check)
-            if (newX >= 0 && newY >= 0 && newX < GRID_WIDTH && newY < GRID_HEIGHT &&
-                grid[newY][newX] === 'empty' && !bombs.some(b => b.x === newX && b.y === newY) &&
-                !(newX === playerGridX && newY === playerGridY) &&
-                !(gameMode === 'pvp' && newX === player2GridX && newY === player2GridY) &&
-                !enemies.some((e, i) => i !== enemyIdx && e.lives > 0 && e.x === newX && e.y === newY)) {
-              enemy.x = newX
-              enemy.y = newY
-              const enemyNewPos = gridToWorld(enemy.x, enemy.y)
-              enemy.mesh.position.x = enemyNewPos.x
-              enemy.mesh.position.y = TILE_SIZE * 0.5
-              enemy.mesh.position.z = enemyNewPos.z
+      // Tiles the AI must not walk into: the players and its living siblings.
+      const blocked: Array<{ x: number; y: number }> = []
+      if (playerLives > 0) blocked.push({ x: playerGridX, y: playerGridY })
+      if (gameMode === 'pvp' && player2Lives > 0) blocked.push({ x: player2GridX, y: player2GridY })
+      for (const other of enemies) {
+        if (other !== enemy && other.lives > 0) blocked.push({ x: other.x, y: other.y })
+      }
 
-              const dx = escapeDir.dx
-              const dy = escapeDir.dy
-              if ((enemy.mesh as any).playAnimation) {
-                if (dx < 0) (enemy.mesh as any).playAnimation('walk-up')
-                else if (dx > 0) (enemy.mesh as any).playAnimation('walk-down')
-                else if (dy < 0) (enemy.mesh as any).playAnimation('walk-left')
-                else if (dy > 0) (enemy.mesh as any).playAnimation('walk-right')
-              }
+      const canStandOn = (nx: number, ny: number) =>
+        nx >= 0 && ny >= 0 && nx < GRID_WIDTH && ny < GRID_HEIGHT &&
+        grid[ny][nx] === 'empty' &&
+        !bombs.some(b => b.x === nx && b.y === ny) &&
+        !blocked.some(b => b.x === nx && b.y === ny)
+
+      const stepTo = (dx: number, dy: number) => {
+        enemy.x += dx
+        enemy.y += dy
+        const anim = (enemy.mesh as any).playAnimation
+        if (anim) {
+          if (dx < 0) anim('walk-up')
+          else if (dx > 0) anim('walk-down')
+          else if (dy < 0) anim('walk-left')
+          else if (dy > 0) anim('walk-right')
+        }
+      }
+
+      const escapeDepth = getEscapeDepth(difficultyConfig, enemy.moveInterval)
+
+      // PRIORITY 1: If in danger, escaping is the only thing that matters.
+      const currentlyInDanger = !isPositionSafe(enemy.x, enemy.y, grid, bombData)
+
+      if (currentlyInDanger) {
+        const escapeDir = getEscapeDirection(
+          enemy.x, enemy.y, grid, GRID_WIDTH, GRID_HEIGHT, bombData, escapeDepth, blocked,
+        )
+
+        if (escapeDir && canStandOn(enemy.x + escapeDir.dx, enemy.y + escapeDir.dy)) {
+          stepTo(escapeDir.dx, escapeDir.dy)
+        } else {
+          // No planned escape — take whichever step is least lethal.
+          const fallback = DIRECTION_STEPS
+            .filter(([dx, dy]) => canStandOn(enemy.x + dx, enemy.y + dy))
+            .sort((a, b) => {
+              const sa = isPositionSafe(enemy.x + a[0], enemy.y + a[1], grid, bombData) ? 1 : 0
+              const sb = isPositionSafe(enemy.x + b[0], enemy.y + b[1], grid, bombData) ? 1 : 0
+              return sb - sa
+            })[0]
+          if (fallback) stepTo(fallback[0], fallback[1])
+        }
+      } else {
+        // PRIORITY 2: Hunt. Higher difficulties navigate with BFS instead of
+        // taking greedy single steps that stall against the first wall.
+        const target = pickAITarget(enemy)
+        let moved = false
+
+        if (target && Math.random() < difficultyConfig.aiPathfindChance) {
+          const path = findPathToTarget(
+            enemy.x, enemy.y, target.x, target.y,
+            grid, GRID_WIDTH, GRID_HEIGHT, bombData, blocked,
+          )
+          if (path) {
+            enemy.tunnelTarget = path.blockedBy ?? null
+            const nx = enemy.x + path.step.dx
+            const ny = enemy.y + path.step.dy
+            if (canStandOn(nx, ny) && isPositionSafe(nx, ny, grid, bombData)) {
+              stepTo(path.step.dx, path.step.dy)
+              moved = true
             }
           } else {
-            // No calculated escape - try any walkable tile
-            for (const [dx, dy] of directions) {
-              const newX = enemy.x + dx
-              const newY = enemy.y + dy
-              if (newX >= 0 && newY >= 0 && newX < GRID_WIDTH && newY < GRID_HEIGHT &&
-                  grid[newY][newX] === 'empty' && !bombs.some(b => b.x === newX && b.y === newY) && 
-                  !(newX === playerGridX && newY === playerGridY) &&
-                  !(gameMode === 'pvp' && newX === player2GridX && newY === player2GridY) &&
-                  !enemies.some((e, i) => i !== enemyIdx && e.lives > 0 && e.x === newX && e.y === newY)) {
-                enemy.x = newX
-                enemy.y = newY
-                const enemyNewPos = gridToWorld(enemy.x, enemy.y)
-                enemy.mesh.position.x = enemyNewPos.x
-                enemy.mesh.position.y = TILE_SIZE * 0.5
-                enemy.mesh.position.z = enemyNewPos.z
-                
-                if ((enemy.mesh as any).playAnimation) {
-                  if (dx < 0) (enemy.mesh as any).playAnimation('walk-up')
-                  else if (dx > 0) (enemy.mesh as any).playAnimation('walk-down')
-                  else if (dy < 0) (enemy.mesh as any).playAnimation('walk-left')
-                  else if (dy > 0) (enemy.mesh as any).playAnimation('walk-right')
-                }
-                break
-              }
-            }
+            enemy.tunnelTarget = null
           }
-        } else {
-          // PRIORITY 2: Not in danger - use normal movement AI
-          // Only consider moves that are SAFE
-          const moveOptions = directions.map(([dx, dy]) => {
-            const newX = enemy.x + dx
-            const newY = enemy.y + dy
-            
-            // Check if move is valid
-            if (newX < 0 || newY < 0 || newX >= GRID_WIDTH || newY >= GRID_HEIGHT) {
-              return { dx, dy, score: -Infinity, isSafe: false }
+        }
+
+        if (!moved) {
+          // Greedy scoring fallback, which is also the easy difficulty's brain.
+          const moveOptions = DIRECTION_STEPS.map(([dx, dy]) => {
+            const nx = enemy.x + dx
+            const ny = enemy.y + dy
+            if (!canStandOn(nx, ny)) return { dx, dy, score: -Infinity }
+            if (!isPositionSafe(nx, ny, grid, bombData)) return { dx, dy, score: -Infinity }
+
+            let score = 100
+            if (powerUps.some(p => p.x === nx && p.y === ny)) score += 200
+
+            if (target) {
+              const next = Math.abs(nx - target.x) + Math.abs(ny - target.y)
+              const now = Math.abs(enemy.x - target.x) + Math.abs(enemy.y - target.y)
+              if (next < now) score += difficultyConfig.aiChaseWeight
+              score -= next * 3
             }
-            
-            const tile = grid[newY][newX]
-            if (tile === 'wall' || tile === 'destructible') {
-              return { dx, dy, score: -Infinity, isSafe: false }
-            }
-            
-            // Check if there's a bomb at the target
-            if (bombs.some(b => b.x === newX && b.y === newY)) {
-              return { dx, dy, score: -Infinity, isSafe: false }
-            }
-            
-            // Check collision with Players and other Enemies
-            if ((newX === playerGridX && newY === playerGridY) ||
-                (gameMode === 'pvp' && newX === player2GridX && newY === player2GridY) ||
-                enemies.some((e, i) => i !== enemyIdx && e.lives > 0 && e.x === newX && e.y === newY)) {
-              return { dx, dy, score: -Infinity, isSafe: false }
-            }
-            
-            // CRITICAL: Check if destination is safe - NEVER move into danger!
-            if (!isPositionSafe(newX, newY, grid, bombData)) {
-              return { dx, dy, score: -Infinity, isSafe: false }
-            }
-            
-            // This move is safe - now calculate its desirability
-            let score = 100 // Base score for safe moves
-            
-            // Check for power-ups at this position
-            const powerUpHere = powerUps.find(p => p.x === newX && p.y === newY)
-            if (powerUpHere) {
-              score += 200 // Prioritize power-ups
-            }
-            
-            // Distance to player
-            const distToPlayer = Math.abs(newX - playerGridX) + Math.abs(newY - playerGridY)
-            const currentDistToPlayer = Math.abs(enemy.x - playerGridX) + Math.abs(enemy.y - playerGridY)
-            
-            // Reward getting closer to player based on difficulty
-            if (distToPlayer < currentDistToPlayer) {
-              switch (settings.difficulty) {
-                case 'easy':
-                  score += 20 // Less aggressive
-                  break
-                case 'medium':
-                  score += 50
-                  break
-                case 'hard':
-                  score += 100 // Very aggressive
-                  break
-              }
-            }
-            
-            // Penalize moving away from player
-            score -= distToPlayer * 3
-            
-            // Add some randomness
             score += Math.random() * 30
-            
-            return { dx, dy, score, isSafe: true }
-          })
-          
-          // Filter to only safe moves
-          const safeMoves = moveOptions.filter(m => m.isSafe)
-          
-          if (safeMoves.length > 0) {
-            // Sort by score and pick the best safe move
-            safeMoves.sort((a, b) => b.score - a.score)
-            const bestMove = safeMoves[0]
-            
-            enemy.x += bestMove.dx
-            enemy.y += bestMove.dy
-            const enemyNewPos = gridToWorld(enemy.x, enemy.y)
-            enemy.mesh.position.x = enemyNewPos.x
-            enemy.mesh.position.y = TILE_SIZE * 0.5
-            enemy.mesh.position.z = enemyNewPos.z
+            return { dx, dy, score }
+          }).filter(m => m.score > -Infinity)
 
-            const dx = bestMove.dx
-            const dy = bestMove.dy
-            if ((enemy.mesh as any).playAnimation) {
-              if (dx < 0) (enemy.mesh as any).playAnimation('walk-up')
-              else if (dx > 0) (enemy.mesh as any).playAnimation('walk-down')
-              else if (dy < 0) (enemy.mesh as any).playAnimation('walk-left')
-              else if (dy > 0) (enemy.mesh as any).playAnimation('walk-right')
-            }
+          if (moveOptions.length > 0) {
+            moveOptions.sort((a, b) => b.score - a.score)
+            stepTo(moveOptions[0].dx, moveOptions[0].dy)
           }
-          // If no safe moves available, stay in place (better than dying!)
+          // If nothing is safe, standing still beats walking into a blast.
         }
+      }
 
-        // BOMB PLACEMENT - Only if not in danger and has bombs available
-        if (!currentlyInDanger && enemyStats[enemyIdx].currentBombs < enemyStats[enemyIdx].maxBombs) {
-          const decision = shouldAIPlaceBomb({
-            enemyX: enemy.x,
-            enemyY: enemy.y,
-            playerX: playerGridX,
-            playerY: playerGridY,
-            grid,
-            gridWidth: GRID_WIDTH,
-            gridHeight: GRID_HEIGHT,
-            bombs: bombData,
-            blastRadius: enemyStats[enemyIdx].blastRadius,
-            difficulty: settings.difficulty
-          })
-          
-          if (decision.shouldPlace && decision.escapeDirection) {
-            // Place the bomb
-            placeBomb(enemy.x, enemy.y, enemyIdx, enemyStats[enemyIdx].blastRadius)
-            enemyStats[enemyIdx].currentBombs++
-            console.log(`💣 AI ${enemyIdx + 1}: ${decision.reason}`)
-            
-            // IMMEDIATELY move in escape direction (same tick!)
-            const escapeX = enemy.x + decision.escapeDirection.dx
-            const escapeY = enemy.y + decision.escapeDirection.dy
-            
-            // Verify escape move is valid
-            if (escapeX >= 0 && escapeY >= 0 && escapeX < GRID_WIDTH && escapeY < GRID_HEIGHT &&
-                grid[escapeY][escapeX] === 'empty' && 
-                !bombs.some(b => b.x === escapeX && b.y === escapeY) &&
-                !(escapeX === playerGridX && escapeY === playerGridY) &&
-                !(gameMode === 'pvp' && escapeX === player2GridX && escapeY === player2GridY) &&
-                !enemies.some((e, i) => i !== enemyIdx && e.lives > 0 && e.x === escapeX && e.y === escapeY)) {
-              enemy.x = escapeX
-              enemy.y = escapeY
-              const enemyNewPos = gridToWorld(enemy.x, enemy.y)
-              enemy.mesh.position.x = enemyNewPos.x
-              enemy.mesh.position.y = TILE_SIZE * 0.5
-              enemy.mesh.position.z = enemyNewPos.z
-              
-              const dx = decision.escapeDirection.dx
-              const dy = decision.escapeDirection.dy
-              if ((enemy.mesh as any).playAnimation) {
-                if (dx < 0) (enemy.mesh as any).playAnimation('walk-up')
-                else if (dx > 0) (enemy.mesh as any).playAnimation('walk-down')
-                else if (dy < 0) (enemy.mesh as any).playAnimation('walk-left')
-                else if (dy > 0) (enemy.mesh as any).playAnimation('walk-right')
-              }
-              console.log(`🏃 AI ${enemyIdx + 1} escaping immediately!`)
-            }
-          }
-        }
-        
-        // Check for power-up collection
-        for (let i = powerUps.length - 1; i >= 0; i--) {
-          const powerUp = powerUps[i]
-          if (powerUp.x === enemy.x && powerUp.y === enemy.y) {
-            if (powerUp.type === 'extraBomb') {
-              enemyStats[enemyIdx].maxBombs++
-              console.log(`AI ${enemyIdx + 1} collected extra bomb! Max bombs:`, enemyStats[enemyIdx].maxBombs)
-            } else if (powerUp.type === 'largerBlast') {
-              enemyStats[enemyIdx].blastRadius++
-              console.log(`AI ${enemyIdx + 1} collected larger blast! Blast radius:`, enemyStats[enemyIdx].blastRadius)
-            }
-            powerUp.mesh.dispose()
-            powerUps.splice(i, 1)
-            updateUI()
+      // BOMB PLACEMENT - only when safe and a bomb is available
+      if (!currentlyInDanger && enemy.currentBombs < enemy.maxBombs) {
+        const target = pickAITarget(enemy)
+        const tunnelAdjacent = !!enemy.tunnelTarget &&
+          Math.abs(enemy.tunnelTarget.x - enemy.x) + Math.abs(enemy.tunnelTarget.y - enemy.y) === 1
+
+        const decision = shouldAIPlaceBomb({
+          enemyX: enemy.x,
+          enemyY: enemy.y,
+          targetX: target ? target.x : enemy.x,
+          targetY: target ? target.y : enemy.y,
+          grid,
+          gridWidth: GRID_WIDTH,
+          gridHeight: GRID_HEIGHT,
+          bombs: bombData,
+          blastRadius: enemy.blastRadius,
+          blocked,
+          config: difficultyConfig,
+          moveIntervalMs: enemy.moveInterval,
+        })
+
+        // Blast a tunnel when the only route to the target runs through a crate.
+        const wantsTunnel = !decision.shouldPlace && tunnelAdjacent &&
+          Math.random() < difficultyConfig.aiTunnelChance
+        const tunnelEscape = wantsTunnel
+          ? getEscapeDirectionForBomb(enemy, bombData, escapeDepth, blocked)
+          : null
+
+        const escapeDirection = decision.escapeDirection ?? tunnelEscape
+        if ((decision.shouldPlace || (wantsTunnel && tunnelEscape)) && escapeDirection) {
+          placeBomb(enemy.x, enemy.y, enemy.id, enemy.blastRadius)
+          enemy.currentBombs++
+          enemy.tunnelTarget = null
+
+          // Immediately start running in the escape direction (same tick).
+          if (canStandOn(enemy.x + escapeDirection.dx, enemy.y + escapeDirection.dy)) {
+            stepTo(escapeDirection.dx, escapeDirection.dy)
           }
         }
       }
 
+      // Check for power-up collection
+      for (let i = powerUps.length - 1; i >= 0; i--) {
+        const powerUp = powerUps[i]
+        if (powerUp.x !== enemy.x || powerUp.y !== enemy.y) continue
+
+        // The AI now benefits from the same core power-ups the player does, so
+        // it no longer falls hopelessly behind after the first minute.
+        // Ceilings come from the difficulty. The AI farms crates efficiently
+        // now, and without a cap it snowballs past the player inside a minute.
+        if (powerUp.type === 'extraBomb') {
+          enemy.maxBombs = Math.min(difficultyConfig.aiMaxBombs, enemy.maxBombs + 1)
+        } else if (powerUp.type === 'largerBlast' || powerUp.type === 'powerBomb') {
+          enemy.blastRadius = Math.min(difficultyConfig.aiMaxBlast, enemy.blastRadius + 1)
+        } else if (powerUp.type === 'speed') {
+          enemy.moveInterval = Math.max(difficultyConfig.aiMinMoveSpeed, enemy.moveInterval - 45)
+        }
+        powerUp.mesh.dispose()
+        powerUps.splice(i, 1)
+        updateUI()
+      }
+
       // Enemies don't damage on collision - they must use bombs!
-    })
+    }
   }
 
   // Check power-up collection
@@ -3760,16 +3918,19 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         powerUp.mesh.dispose()
         powerUps.splice(i, 1)
         updateUI()
+
+        // Player 2 collected power-ups silently before this.
+        if (soundManager) soundManager.playSFX('powerup')
+        statsManager.recordPowerUpCollected()
       }
     }
   }
 
-  // Kick bomb function
-  function kickBomb(dx: number, dy: number) {
-    if (!hasKick) return false
-    
+  // Kick bomb function — shared by both players so Player 2's kick power-up
+  // actually does something (it used to be a no-op comment).
+  function kickBombFrom(originX: number, originY: number, dx: number, dy: number) {
     // Check if there's a bomb in the direction we're moving
-    const bombAtTarget = bombs.find(b => b.x === playerGridX + dx && b.y === playerGridY + dy)
+    const bombAtTarget = bombs.find(b => b.x === originX + dx && b.y === originY + dy)
     if (!bombAtTarget) return false
 
     // Find the nearest obstacle in the kick direction
@@ -3822,6 +3983,16 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       return true
     }
     return false
+  }
+
+  function kickBomb(dx: number, dy: number) {
+    if (!hasKick) return false
+    return kickBombFrom(playerGridX, playerGridY, dx, dy)
+  }
+
+  function kickBombPlayer2(dx: number, dy: number) {
+    if (!player2HasKick) return false
+    return kickBombFrom(player2GridX, player2GridY, dx, dy)
   }
 
   // Throw bomb function
@@ -3979,23 +4150,51 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   // Track which keys are currently held down for smooth movement
   const keysHeld: Set<string> = new Set()
 
-  if (isMobile()) {
-    // Clean up any existing mobile controls
-    const existingControls = document.querySelector('.mobile-controls-container')
-    if (existingControls) existingControls.remove()
+  // On-screen controls. Driven by the "On-Screen Controls" setting rather than
+  // isMobile(), so desktop players can opt into the D-pad and bomb button and
+  // drive them with the mouse.
+  if (useOnScreenControls) {
+    // Clean up any existing controls
+    document.querySelectorAll('.mobile-controls-container').forEach(el => el.remove())
 
-    const mobileContainer = document.createElement('div')
-    mobileContainer.className = 'mobile-controls-container mobile-controls-visible'
-    document.body.appendChild(mobileContainer)
+    const controlsContainer = document.createElement('div')
+    controlsContainer.className = 'mobile-controls-container mobile-controls-visible'
+    if (!isMobileDevice) controlsContainer.classList.add('desktop-controls')
+    document.body.appendChild(controlsContainer)
 
-    // D-Pad with touch-slide support
+    // D-Pad with slide support
     const dpad = document.createElement('div')
     dpad.className = 'dpad'
-    mobileContainer.appendChild(dpad)
+    controlsContainer.appendChild(dpad)
 
     // Track D-pad buttons for slide detection
     const dpadButtons: { btn: HTMLElement; key: string }[] = []
     let activeDpadKey: string | null = null
+    let dpadPointerId: number | null = null
+
+    const releaseAllDpadKeys = () => {
+      dpadButtons.forEach(({ btn, key }) => {
+        keysHeld.delete(key)
+        keyPressTime.delete(key)
+        btn.classList.remove('active')
+      })
+      activeDpadKey = null
+    }
+
+    const engageKey = (key: string) => {
+      if (activeDpadKey === key) return
+      releaseAllDpadKeys()
+      const entry = dpadButtons.find(b => b.key === key)
+      if (!entry) return
+      keysHeld.add(key)
+      keyPressTime.set(key, Date.now())
+      entry.btn.classList.add('active')
+      activeDpadKey = key
+      // Step immediately instead of waiting for the next frame's poll. A quick
+      // mouse click can start and finish inside a single frame, which would
+      // otherwise register as no input at all.
+      if (!gameOver && !isPaused) processHeldKeys()
+    }
 
     const createBtn = (cls: string, key: string) => {
       const btn = document.createElement('div')
@@ -4003,40 +4202,12 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       dpad.appendChild(btn)
       dpadButtons.push({ btn, key })
 
-      const activateKey = (k: string, b: HTMLElement) => {
-        if (!keysHeld.has(k)) {
-          keysHeld.add(k)
-          keyPressTime.set(k, Date.now())
-        }
-        b.classList.add('active')
-        activeDpadKey = k
-      }
-      const deactivateKey = (k: string, b: HTMLElement) => {
-        keysHeld.delete(k)
-        keyPressTime.delete(k)
-        b.classList.remove('active')
-        if (activeDpadKey === k) activeDpadKey = null
-      }
-
-      const start = (e: Event) => {
+      // Pointer events cover mouse, touch and pen with one code path.
+      btn.addEventListener('pointerdown', (e) => {
         if (e.cancelable) e.preventDefault()
-        // Deactivate any other dpad button first
-        dpadButtons.forEach(({ btn: ob, key: ok }) => {
-          if (ok !== key) deactivateKey(ok, ob)
-        })
-        activateKey(key, btn)
-      }
-      const end = (e: Event) => {
-        if (e.cancelable) e.preventDefault()
-        deactivateKey(key, btn)
-      }
-
-      btn.addEventListener('touchstart', start, {passive: false})
-      btn.addEventListener('touchend', end, {passive: false})
-      btn.addEventListener('touchcancel', end, {passive: false})
-      btn.addEventListener('mousedown', start)
-      btn.addEventListener('mouseup', end)
-      btn.addEventListener('mouseleave', end)
+        dpadPointerId = e.pointerId
+        engageKey(key)
+      })
     }
 
     createBtn('dpad-up', 'w')
@@ -4044,59 +4215,46 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     createBtn('dpad-left', 'a')
     createBtn('dpad-right', 'd')
 
-    // Handle touch-slide across D-pad buttons
-    dpad.addEventListener('touchmove', (e) => {
+    // Slide between D-pad buttons without lifting the finger / mouse button
+    dpad.addEventListener('pointermove', (e) => {
+      if (dpadPointerId === null || e.pointerId !== dpadPointerId) return
       if (e.cancelable) e.preventDefault()
-      const touch = e.touches[0]
-      if (!touch) return
-      const el = document.elementFromPoint(touch.clientX, touch.clientY) as HTMLElement | null
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
       if (!el) return
 
       for (const { btn, key } of dpadButtons) {
         if (el === btn || btn.contains(el)) {
-          if (activeDpadKey !== key) {
-            // Deactivate old button, activate new one
-            dpadButtons.forEach(({ btn: ob, key: ok }) => {
-              if (ok !== key) { keysHeld.delete(ok); keyPressTime.delete(ok); ob.classList.remove('active') }
-            })
-            keysHeld.add(key)
-            keyPressTime.set(key, Date.now())
-            btn.classList.add('active')
-            activeDpadKey = key
-          }
+          engageKey(key)
           return
         }
       }
-    }, { passive: false })
+    })
 
-    // Safety: clear all D-pad keys if touch ends outside any button (ghost key prevention)
-    dpad.addEventListener('touchend', () => {
-      dpadButtons.forEach(({ btn: ob, key: ok }) => {
-        keysHeld.delete(ok); keyPressTime.delete(ok); ob.classList.remove('active')
-      })
-      activeDpadKey = null
-    }, { passive: false })
-    dpad.addEventListener('touchcancel', () => {
-      dpadButtons.forEach(({ btn: ob, key: ok }) => {
-        keysHeld.delete(ok); keyPressTime.delete(ok); ob.classList.remove('active')
-      })
-      activeDpadKey = null
-    }, { passive: false })
+    // Releasing anywhere clears the D-pad, so a pointer that leaves the button
+    // (or a window that loses focus) can never leave a direction stuck down.
+    const releaseDpad = (e?: PointerEvent) => {
+      if (e && dpadPointerId !== null && e.pointerId !== dpadPointerId) return
+      dpadPointerId = null
+      releaseAllDpadKeys()
+    }
+    window.addEventListener('pointerup', releaseDpad)
+    window.addEventListener('pointercancel', releaseDpad)
+    window.addEventListener('blur', () => releaseDpad())
 
     // Action Button
     const actionContainer = document.createElement('div')
     actionContainer.className = 'action-btn-container'
-    mobileContainer.appendChild(actionContainer)
+    controlsContainer.appendChild(actionContainer)
 
     const actionBtn = document.createElement('div')
     actionBtn.className = 'action-btn'
     actionBtn.textContent = 'BOMB'
     actionContainer.appendChild(actionBtn)
 
-    const performAction = (e: Event) => {
+    const performAction = (e: PointerEvent) => {
       if (e.cancelable) e.preventDefault()
       actionBtn.classList.add('active')
-      
+
       if (gameOver || isPaused) return
 
       const bombAtPlayer = bombs.find(b => b.x === playerGridX && b.y === playerGridY)
@@ -4108,34 +4266,35 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         placeBomb(playerGridX, playerGridY)
       }
     }
-    
-    const endAction = (e: Event) => {
-       if (e.cancelable) e.preventDefault()
-       actionBtn.classList.remove('active')
-    }
 
-    actionBtn.addEventListener('touchstart', performAction, {passive: false})
-    actionBtn.addEventListener('touchend', endAction, {passive: false})
-    actionBtn.addEventListener('mousedown', performAction)
-    actionBtn.addEventListener('mouseup', endAction)
-    actionBtn.addEventListener('mouseleave', endAction)
+    const endAction = () => actionBtn.classList.remove('active')
 
-    // Handle resizing to toggle controls visibility
-    const mobileResizeHandler = () => {
-      const isStillMobile = isMobile()
-      const pauseBtn = document.getElementById('mobile-pause-btn')
+    actionBtn.addEventListener('pointerdown', performAction)
+    window.addEventListener('pointerup', endAction)
+    window.addEventListener('pointercancel', endAction)
 
-      if (isStillMobile) {
-        mobileContainer.classList.add('mobile-controls-visible')
-        if (pauseBtn) pauseBtn.style.display = 'flex'
+    // In AUTO mode the controls follow the viewport across resizes/rotations.
+    // The pause button is deliberately not tied to this — it stays visible
+    // whether or not the D-pad is showing.
+    const controlsResizeHandler = () => {
+      const visible = showOnScreenControls(settingsManager.getSettings().onScreenControls)
+      if (visible) {
+        controlsContainer.classList.add('mobile-controls-visible')
       } else {
-        mobileContainer.classList.remove('mobile-controls-visible')
-        if (pauseBtn) pauseBtn.style.display = 'none'
+        controlsContainer.classList.remove('mobile-controls-visible')
+        releaseDpad()
       }
     }
-    window.addEventListener('resize', mobileResizeHandler)
+    window.addEventListener('resize', controlsResizeHandler)
+
     scene.onDisposeObservable.add(() => {
-      window.removeEventListener('resize', mobileResizeHandler)
+      window.removeEventListener('resize', controlsResizeHandler)
+      window.removeEventListener('pointerup', releaseDpad)
+      window.removeEventListener('pointercancel', releaseDpad)
+      window.removeEventListener('pointerup', endAction)
+      window.removeEventListener('pointercancel', endAction)
+      releaseAllDpadKeys()
+      controlsContainer.remove()
     })
   }
 
@@ -4266,11 +4425,24 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     return true
   }
   
+  /** Point a character mesh in the direction it just moved. */
+  function faceDirection(mesh: any, dx: number, dy: number) {
+    if (!mesh || !mesh.playAnimation) return
+    if (dx < 0) mesh.playAnimation('walk-up')
+    else if (dx > 0) mesh.playAnimation('walk-down')
+    else if (dy < 0) mesh.playAnimation('walk-left')
+    else if (dy > 0) mesh.playAnimation('walk-right')
+  }
+
   function movePlayer2(dx: number, dy: number, currentTime: number): boolean {
     if (currentTime - lastPlayer2MoveTime < player2MoveDelay) return false
-    
+
     lastPlayer2Dx = dx
     lastPlayer2Dy = dy
+
+    // Player 2 never got a walk animation, so it slid around always facing the
+    // same way. Turn first, exactly like Player 1 does.
+    faceDirection(player2, dx, dy)
 
     const targetX = player2GridX + dx
     const targetY = player2GridY + dy
@@ -4282,7 +4454,11 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       if (player2GhostTimer > 0) {
         // Ghost mode: walk through bombs
       } else if (player2HasKick) {
-        // Kick handled elsewhere
+        // Kick it instead of walking onto it (the old code fell through here
+        // and let Player 2 stand on top of a live bomb).
+        kickBombPlayer2(dx, dy)
+        lastPlayer2MoveTime = currentTime
+        return true
       } else {
         return false
       }
@@ -4293,18 +4469,15 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
     // Check collision with enemies (blocking)
     if (enemies.some(e => e.lives > 0 && e.x === targetX && e.y === targetY)) return false
-    
+
     // Check collision with Player 1
     if (targetX === playerGridX && targetY === playerGridY) return false
 
     player2GridX = targetX
     player2GridY = targetY
     // Don't instantly set position - let the smooth interpolation handle it
-    // const newPos2 = gridToWorld(player2GridX, player2GridY)
-    // player2.position.x = newPos2.x
-    // player2.position.z = newPos2.z
     lastPlayer2MoveTime = currentTime
-    
+
     checkPowerUps()
     return true
   }
@@ -4572,6 +4745,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     const deltaTime = currentTime - lastTime
     lastTime = currentTime
 
+    // Flush coalesced UI writes even while paused, so the panels are populated
+    // during the pre-game countdown.
+    flushUI()
+
     if (!isPaused) {
       // Process held keys for smooth continuous movement
       processHeldKeys()
@@ -4604,11 +4781,11 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         }
       })
       
-      // Camera follow logic for mobile
-      if (isMobile()) {
+      // Camera follow logic for mobile (cached — isMobile() reads window.innerWidth)
+      if (isMobileDevice) {
         const targetX = player.position.x
         const targetZ = player.position.z
-        
+
         const minX = -halfWorldWidth - margin + viewportHalfWidth
         const maxX = halfWorldWidth + margin - viewportHalfWidth
         const minZ = -halfWorldHeight - margin + viewportHalfHeight
@@ -4662,20 +4839,6 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         }
       }
       
-      // Update sprite animations - Disabled as new 3D meshes self-animate via observers
-      /*
-      if (player.update) {
-        player.update(deltaTime)
-      }
-      if (player2 && player2.update) {
-        player2.update(deltaTime)
-      }
-      enemies.forEach(enemy => {
-        if (enemy.mesh.update) {
-          enemy.mesh.update(deltaTime)
-        }
-      })
-      */
     }
   })
 
@@ -4691,7 +4854,20 @@ function startGame(mode: GameMode) {
     currentEngine.dispose()
   }
 
-  currentEngine = new Engine(canvas, true)
+  // stencil/depth buffers this game never reads just cost bandwidth, and
+  // antialiasing is dropped on phones where fill rate is the bottleneck.
+  const onPhone = isMobile()
+  currentEngine = new Engine(canvas, !onPhone, {
+    preserveDrawingBuffer: false,
+    stencil: false,
+    powerPreference: 'high-performance',
+    doNotHandleContextLost: true,
+  })
+  // Cap the render resolution on very dense displays — a 3x DPR phone would
+  // otherwise shade nine times as many pixels for no visible gain.
+  const dpr = window.devicePixelRatio || 1
+  if (onPhone && dpr > 2) currentEngine.setHardwareScalingLevel(dpr / 2)
+
   currentScene = createScene(currentEngine, mode)
   
   // IMMEDIATELY UNLOCK AUDIO on user interaction
@@ -4775,8 +4951,7 @@ const pauseMenu = createPauseMenu(
     }
     
     // Remove UI elements
-    // Added .mobile-pause-btn to cleanup list
-    const elementsToRemove = ['.game-ui-panel', '.center-ui', '.mobile-controls-container', '.offscreen-indicator', '.mobile-pause-btn']
+    const elementsToRemove = ['.game-ui-panel', '.center-ui', '.mobile-controls-container', '.offscreen-indicator', '.game-pause-btn']
     elementsToRemove.forEach(selector => {
       document.querySelectorAll(selector).forEach(el => el.remove())
     })
@@ -4796,6 +4971,8 @@ const settingsMenu = createSettingsMenu(
   () => {
     settingsMenu.style.display = 'none'
     mainMenu.style.display = 'flex'
+    // The same setting is exposed on both screens — resync the menu toggle.
+    ;(mainMenu as any).refreshExtendedPowerUps?.()
   }
 )
 document.body.appendChild(settingsMenu)
@@ -4811,7 +4988,9 @@ document.body.appendChild(statsScreen)
 const mainMenu = createMainMenu({
   onStartGame: (mode) => {
     startGame(mode)
-  }
+  },
+  getExtendedPowerUps: () => settingsManager.getSettings().extendedPowerUps,
+  onToggleExtendedPowerUps: (enabled) => settingsManager.setExtendedPowerUps(enabled),
 })
 document.body.appendChild(mainMenu)
 
@@ -4870,6 +5049,7 @@ mainMenu.addEventListener('click', (e) => {
   
   switch (button.id) {
     case 'settings-button':
+      ;(settingsMenu as any).refresh?.()
       mainMenu.style.display = 'none'
       settingsMenu.style.display = 'flex'
       break

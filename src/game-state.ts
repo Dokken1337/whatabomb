@@ -45,9 +45,14 @@ export class GameStateManager {
     this.roundState.currentRound++
   }
 
+  getWinsNeeded(): number {
+    if (!this.roundState) return 0
+    return Math.ceil(this.roundState.maxRounds / 2)
+  }
+
   isMatchOver(): boolean {
     if (!this.roundState) return false
-    const winsNeeded = Math.ceil(this.roundState.maxRounds / 2)
+    const winsNeeded = this.getWinsNeeded()
     return (
       this.roundState.playerWins >= winsNeeded ||
       this.roundState.enemyWins >= winsNeeded
@@ -95,6 +100,11 @@ export class GameStateManager {
     const minutes = Math.floor(seconds / 60)
     const secs = seconds % 60
     return `${minutes}:${secs.toString().padStart(2, '0')}`
+  }
+
+  /** Clears per-round state but keeps the match score for the next round. */
+  resetRoundScopedState() {
+    this.timeAttackState = null
   }
 
   reset() {

@@ -4,6 +4,10 @@ export type GameMode = '1v1' | '1v2' | '1v3' | 'pvp' | 'time-attack' | 'survival
 
 export interface MenuOptions {
   onStartGame: (mode: GameMode) => void
+  /** Current state of the Extended Power-Ups setting. */
+  getExtendedPowerUps: () => boolean
+  /** Persist a new Extended Power-Ups state. */
+  onToggleExtendedPowerUps: (enabled: boolean) => void
 }
 
 // Countdown before game starts
@@ -76,7 +80,7 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   
   // Subtitle
   const subtitle = document.createElement('p')
-  subtitle.textContent = 'By Fredrik, V5.0.1'
+  subtitle.textContent = 'By Fredrik, V6.0.0'
   subtitle.style.fontSize = '16px'
   subtitle.style.color = '#aaa'
   subtitle.style.marginTop = '-30px'
@@ -95,11 +99,12 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
     { mode: 'time-attack', label: 'Time Attack', icon: '⏱️' },
   ]
 
-  // Re-check mobile on menu creation to be safe
+  // Re-check mobile on menu creation to be safe.
+  // Only local PvP is hidden on touch devices — it needs two keyboards.
   const currentIsMobile = isMobile()
 
   const modes = currentIsMobile
-    ? allModes.filter(m => m.mode !== 'pvp' && m.mode !== 'survival' && m.mode !== 'time-attack')
+    ? allModes.filter(m => m.mode !== 'pvp')
     : allModes
 
   // Button container for game modes
@@ -165,13 +170,15 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   buttonContainer.style.flexWrap = 'wrap'
   buttonContainer.style.justifyContent = 'center'
 
+  // Fullscreen is offered everywhere except iOS, where Safari only exposes the
+  // Fullscreen API for video/audio elements.
   const buttons = [
     { id: 'settings-button', text: '⚙️ Settings' },
     { id: 'stats-button', text: '📊 Stats' },
     { id: 'achievements-button', text: '🏆 Achievements' },
     { id: 'tutorial-button', text: '📖 How to Play' },
     { id: 'map-selection-button', text: '🗺️ Maps' },
-    ...(currentIsMobile && !isIOS() ? [{ id: 'fullscreen-button', text: '⛶ Fullscreen' }] : []),
+    ...(isIOS() ? [] : [{ id: 'fullscreen-button', text: '⛶ Fullscreen' }]),
   ]
 
   buttons.forEach(btn => {
@@ -203,6 +210,45 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   })
 
   menuDiv.appendChild(buttonContainer)
+
+  // Extended Power-Ups quick toggle — the same setting as in the Settings
+  // screen, surfaced here because it changes how a whole match plays.
+  const powerUpToggleRow = document.createElement('div')
+  powerUpToggleRow.style.display = 'flex'
+  powerUpToggleRow.style.justifyContent = 'center'
+  powerUpToggleRow.style.marginTop = '14px'
+
+  const powerUpToggle = document.createElement('button')
+  powerUpToggle.id = 'extended-powerups-toggle'
+  powerUpToggle.className = 'powerup-toggle'
+  powerUpToggle.title = 'Adds Shield, Pierce, Ghost, Power Bomb and Line Bomb to the drop pool'
+  // The five extra power-ups are shown inline: full colour when enabled,
+  // greyed out when not, so the state is readable without parsing the label.
+  powerUpToggle.innerHTML = `
+    <span class="pt-label">🎲 Extended Power-Ups</span>
+    <span class="pt-icons">🛡️🔥👻☢️🧨</span>
+    <span class="pt-state"></span>
+  `
+  const powerUpState = powerUpToggle.querySelector('.pt-state') as HTMLElement
+
+  const paintPowerUpToggle = (enabled: boolean) => {
+    powerUpToggle.classList.toggle('is-on', enabled)
+    powerUpToggle.classList.toggle('is-off', !enabled)
+    powerUpState.textContent = enabled ? 'ON' : 'OFF'
+    powerUpToggle.setAttribute('aria-pressed', String(enabled))
+  }
+  paintPowerUpToggle(options.getExtendedPowerUps())
+
+  powerUpToggle.addEventListener('click', () => {
+    const next = !options.getExtendedPowerUps()
+    options.onToggleExtendedPowerUps(next)
+    paintPowerUpToggle(next)
+  })
+  // Keep in sync when the setting is changed from the Settings screen instead.
+  ;(menuDiv as any).refreshExtendedPowerUps = () => paintPowerUpToggle(options.getExtendedPowerUps())
+
+  powerUpToggleRow.appendChild(powerUpToggle)
+  menuDiv.appendChild(powerUpToggleRow)
   
   // Controls hint removed per user request
 

@@ -1,4 +1,18 @@
+/** 'auto' shows the touch pad on mobile only; 'on'/'off' force it either way. */
+export type OnScreenControlsMode = 'auto' | 'on' | 'off'
+
+/** Player names are capped so they always fit the HUD panel and scoreboards. */
+export const MAX_PLAYER_NAME_LENGTH = 8
+export const DEFAULT_PLAYER_NAME = 'Player 1'
+
+/** Trim, clamp to the length limit, and fall back to the default when empty. */
+export function sanitizePlayerName(name: string): string {
+  const trimmed = (name ?? '').trim().slice(0, MAX_PLAYER_NAME_LENGTH)
+  return trimmed.length > 0 ? trimmed : DEFAULT_PLAYER_NAME
+}
+
 export interface GameSettings {
+  playerName: string
   musicVolume: number
   sfxVolume: number
   screenShake: boolean
@@ -9,6 +23,8 @@ export interface GameSettings {
   player2Color: string
   characterShape: 'sphere' | 'cat' | 'dog'
   extendedPowerUps: boolean
+  onScreenControls: OnScreenControlsMode
+  rounds: 1 | 3 | 5
 }
 
 export const PLAYER_COLORS = [
@@ -43,6 +59,7 @@ export class SettingsManager {
         const parsed = JSON.parse(saved)
         // Ensure new properties have defaults
         return {
+          playerName: sanitizePlayerName(parsed.playerName ?? DEFAULT_PLAYER_NAME),
           musicVolume: parsed.musicVolume ?? 0.2,
           sfxVolume: parsed.sfxVolume ?? 0.7,
           screenShake: parsed.screenShake ?? true,
@@ -53,13 +70,16 @@ export class SettingsManager {
           player2Color: parsed.player2Color ?? '#60a5fa',
           characterShape: parsed.characterShape ?? 'sphere',
           extendedPowerUps: parsed.extendedPowerUps ?? false,
+          onScreenControls: parsed.onScreenControls ?? 'auto',
+          rounds: parsed.rounds ?? 3,
         }
       } catch (e) {
         console.error('Failed to load settings:', e)
       }
     }
-    
+
     return {
+      playerName: DEFAULT_PLAYER_NAME,
       musicVolume: 0.2,
       sfxVolume: 0.7,
       screenShake: true,
@@ -70,6 +90,8 @@ export class SettingsManager {
       player2Color: '#60a5fa',
       characterShape: 'sphere',
       extendedPowerUps: false,
+      onScreenControls: 'auto',
+      rounds: 3,
     }
   }
 
@@ -128,6 +150,21 @@ export class SettingsManager {
 
   setHaptics(enabled: boolean) {
     this.settings.haptics = enabled
+    this.saveSettings()
+  }
+
+  setOnScreenControls(mode: OnScreenControlsMode) {
+    this.settings.onScreenControls = mode
+    this.saveSettings()
+  }
+
+  setRounds(rounds: 1 | 3 | 5) {
+    this.settings.rounds = rounds
+    this.saveSettings()
+  }
+
+  setPlayerName(name: string) {
+    this.settings.playerName = sanitizePlayerName(name)
     this.saveSettings()
   }
 }
