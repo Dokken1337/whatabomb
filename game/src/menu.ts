@@ -169,7 +169,7 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   
   // Subtitle
   const subtitle = document.createElement('p')
-  subtitle.textContent = 'By Fredrik, V6.0.0'
+  subtitle.textContent = 'By Fredrik, V10.0.0'
   subtitle.style.fontSize = '16px'
   subtitle.style.color = '#aaa'
   subtitle.style.marginTop = '-30px'
@@ -261,7 +261,9 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   const buttonContainer = document.createElement('div')
   buttonContainer.style.display = 'flex'
   buttonContainer.style.gap = '12px'
-  buttonContainer.style.marginTop = '25px'
+  // Tighter than the gap above the power-up toggle, so the toggle reads as
+  // part of the match setup rather than as one of the utility buttons.
+  buttonContainer.style.marginTop = '18px'
   buttonContainer.style.flexWrap = 'wrap'
   buttonContainer.style.justifyContent = 'center'
 
@@ -305,14 +307,14 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
     buttonContainer.appendChild(button)
   })
 
-  menuDiv.appendChild(buttonContainer)
-
   // Extended Power-Ups quick toggle — the same setting as in the Settings
   // screen, surfaced here because it changes how a whole match plays.
+  // Appended before the secondary buttons so it sits directly under the game
+  // modes it affects.
   const powerUpToggleRow = document.createElement('div')
   powerUpToggleRow.style.display = 'flex'
   powerUpToggleRow.style.justifyContent = 'center'
-  powerUpToggleRow.style.marginTop = '14px'
+  powerUpToggleRow.style.marginTop = '22px'
 
   const powerUpToggle = document.createElement('button')
   powerUpToggle.id = 'extended-powerups-toggle'
@@ -345,6 +347,7 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
 
   powerUpToggleRow.appendChild(powerUpToggle)
   menuDiv.appendChild(powerUpToggleRow)
+  menuDiv.appendChild(buttonContainer)
   
   // Controls hint removed per user request
 
