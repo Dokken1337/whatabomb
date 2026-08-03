@@ -14,7 +14,7 @@ param appServicePlanCapacity = 2
 
 // Smallest Azure Managed Redis tier; the workload is a few small lobby records
 // plus pub/sub traffic that is never retained.
-param redisSkuName = 'Balanced_B0'
+param redisSkuName = 'Balanced_B1'
 
 param linuxFxVersion = 'NODE|22-lts'
 
