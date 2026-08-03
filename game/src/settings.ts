@@ -15,6 +15,10 @@ export interface GameSettings {
   playerName: string
   musicVolume: number
   sfxVolume: number
+  /** Menu clicks and other interface feedback, on their own bus. */
+  uiVolume: number
+  /** Master kill switch. Kept separate so it never overwrites the sliders. */
+  muteAll: boolean
   screenShake: boolean
   particles: boolean
   haptics: boolean
@@ -62,6 +66,8 @@ export class SettingsManager {
           playerName: sanitizePlayerName(parsed.playerName ?? DEFAULT_PLAYER_NAME),
           musicVolume: parsed.musicVolume ?? 0.2,
           sfxVolume: parsed.sfxVolume ?? 0.7,
+          uiVolume: parsed.uiVolume ?? 0.6,
+          muteAll: parsed.muteAll ?? false,
           screenShake: parsed.screenShake ?? true,
           particles: parsed.particles ?? true,
           haptics: parsed.haptics ?? true,
@@ -82,6 +88,8 @@ export class SettingsManager {
       playerName: DEFAULT_PLAYER_NAME,
       musicVolume: 0.2,
       sfxVolume: 0.7,
+      uiVolume: 0.6,
+      muteAll: false,
       screenShake: true,
       particles: true,
       haptics: true,
@@ -110,6 +118,16 @@ export class SettingsManager {
 
   setSFXVolume(volume: number) {
     this.settings.sfxVolume = Math.max(0, Math.min(1, volume))
+    this.saveSettings()
+  }
+
+  setUIVolume(volume: number) {
+    this.settings.uiVolume = Math.max(0, Math.min(1, volume))
+    this.saveSettings()
+  }
+
+  setMuteAll(muted: boolean) {
+    this.settings.muteAll = muted
     this.saveSettings()
   }
 

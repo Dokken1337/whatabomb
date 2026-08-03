@@ -103,6 +103,17 @@ export function createLobbyScreen(options: LobbyScreenOptions): HTMLDivElement {
   codeRow.appendChild(joinBtn)
 
   choicePanel.appendChild(codeRow)
+
+  // Lobbies live on the server that served this page, so two players on
+  // different addresses (one on localhost, one on the public site) can never
+  // see each other's codes. Naming the host makes that mismatch obvious instead
+  // of looking like a wrong or expired code.
+  const serverNote = document.createElement('div')
+  serverNote.className = 'lobby-hint'
+  serverNote.style.marginTop = '14px'
+  serverNote.textContent = `Everyone must be on ${location.host}`
+  choicePanel.appendChild(serverNote)
+
   root.appendChild(choicePanel)
 
   // ── Panel: the lobby itself ──────────────────────────────────────────────

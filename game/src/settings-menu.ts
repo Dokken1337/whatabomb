@@ -2,12 +2,109 @@ import {
   SettingsManager,
   PLAYER_COLORS,
   CHARACTER_SHAPES,
-  MAX_PLAYER_NAME_LENGTH,
-  DEFAULT_PLAYER_NAME,
-  sanitizePlayerName,
 } from './settings'
 import { SoundManager } from './sound-manager'
 import { setHapticsEnabled } from './device'
+
+/** A settings section that can re-read the stored value on demand. */
+type RefreshableSection = HTMLDivElement & { refresh?: () => void }
+
+/**
+ * The three volume sliders plus the master mute, as one self-contained block.
+ *
+ * Lives here rather than inline in the settings screen because the in-game
+ * pause menu shows the very same controls — audio is the one thing worth
+ * changing without abandoning a match.
+ */
+export function createAudioSettings(
+  settingsManager: SettingsManager,
+  getSoundManager: () => SoundManager | null,
+): RefreshableSection {
+  const section = document.createElement('div') as RefreshableSection
+  const settings = settingsManager.getSettings()
+
+  const musicSection = createSliderSetting('🎵 Music Volume', settings.musicVolume, value => {
+    settingsManager.setMusicVolume(value)
+    getSoundManager()?.setMusicVolume(value)
+  })
+  section.appendChild(musicSection)
+
+  const sfxSection = createSliderSetting('🔊 Sound Effects', settings.sfxVolume, value => {
+    settingsManager.setSFXVolume(value)
+    getSoundManager()?.setSFXVolume(value)
+  })
+  section.appendChild(sfxSection)
+
+  const uiSection = createSliderSetting('🖱️ Interface Sounds', settings.uiVolume, value => {
+    settingsManager.setUIVolume(value)
+    getSoundManager()?.setUIVolume(value)
+  })
+  section.appendChild(uiSection)
+
+  const uiDesc = document.createElement('div')
+  uiDesc.style.fontSize = '11px'
+  uiDesc.style.color = '#888'
+  uiDesc.style.marginTop = '-18px'
+  uiDesc.style.marginBottom = '20px'
+  uiDesc.style.lineHeight = '1.5'
+  uiDesc.textContent = 'Menu clicks and button hovers, separate from in-game effects.'
+  section.appendChild(uiDesc)
+
+  // Master mute. Deliberately a separate switch rather than dragging every
+  // slider to zero, so the previous mix comes back untouched when it is lifted.
+  const muteRow = document.createElement('div')
+  muteRow.style.marginBottom = '25px'
+
+  const muteButton = document.createElement('button')
+  muteButton.style.width = '100%'
+  muteButton.style.padding = '14px'
+  muteButton.style.fontFamily = "'Press Start 2P', monospace"
+  muteButton.style.fontSize = '11px'
+  muteButton.style.cursor = 'pointer'
+  muteButton.style.borderRadius = '8px'
+  muteButton.style.transition = 'all 0.2s ease'
+
+  let muted = settings.muteAll
+
+  const paintMute = () => {
+    muteButton.textContent = muted ? '🔇 ALL SOUND MUTED' : '🔈 MUTE ALL SOUND'
+    muteButton.setAttribute('aria-pressed', String(muted))
+    if (muted) {
+      muteButton.style.background = 'linear-gradient(180deg, #ef4444 0%, #b91c1c 100%)'
+      muteButton.style.border = '3px solid #7f1d1d'
+      muteButton.style.color = '#fff'
+      muteButton.style.boxShadow = '0 0 15px rgba(239,68,68,0.5), 0 4px 0 #7f1d1d'
+    } else {
+      muteButton.style.background = 'linear-gradient(180deg, #374151 0%, #1f2937 100%)'
+      muteButton.style.border = '3px solid #4b5563'
+      muteButton.style.color = '#9ca3af'
+      muteButton.style.boxShadow = '0 4px 0 #1f2937'
+    }
+  }
+  paintMute()
+
+  muteButton.addEventListener('click', () => {
+    muted = !muted
+    settingsManager.setMuteAll(muted)
+    getSoundManager()?.setMuted(muted)
+    paintMute()
+  })
+
+  muteRow.appendChild(muteButton)
+  section.appendChild(muteRow)
+
+  // The same controls exist on two screens, so re-read on open.
+  section.refresh = () => {
+    const current = settingsManager.getSettings()
+    ;(musicSection as any).setValue?.(current.musicVolume)
+    ;(sfxSection as any).setValue?.(current.sfxVolume)
+    ;(uiSection as any).setValue?.(current.uiVolume)
+    muted = current.muteAll
+    paintMute()
+  }
+
+  return section
+}
 
 export function createSettingsMenu(
   settingsManager: SettingsManager,
@@ -42,6 +139,8 @@ export function createSettingsMenu(
   title.style.textShadow = '0 0 10px #ff6600, 0 0 20px #ff6600, 3px 3px 0px #000'
   settingsDiv.appendChild(title)
 
+  // One column, scrolled. There is more here than fits on any screen, and
+  // splitting it into columns made it harder to read rather than easier.
   const settingsContainer = document.createElement('div')
   settingsContainer.style.maxWidth = '500px'
   settingsContainer.style.width = '90%'
@@ -52,42 +151,10 @@ export function createSettingsMenu(
 
   const settings = settingsManager.getSettings()
 
-  // Player Name — shown on the HUD and scoreboards, and ready to identify this
-  // player once online multiplayer lands.
-  const playerNameSection = createTextSetting(
-    '🙋 Player Name',
-    settings.playerName,
-    DEFAULT_PLAYER_NAME,
-    MAX_PLAYER_NAME_LENGTH,
-    (value) => {
-      settingsManager.setPlayerName(value)
-    }
-  )
-  settingsContainer.appendChild(playerNameSection)
-
-  // Music Volume
-  const musicSection = createSliderSetting(
-    '🎵 Music Volume',
-    settings.musicVolume,
-    (value) => {
-      settingsManager.setMusicVolume(value)
-      const sm = getSoundManager()
-      if (sm) sm.setMusicVolume(value)
-    }
-  )
-  settingsContainer.appendChild(musicSection)
-
-  // SFX Volume
-  const sfxSection = createSliderSetting(
-    '🔊 Sound Effects',
-    settings.sfxVolume,
-    (value) => {
-      settingsManager.setSFXVolume(value)
-      const sm = getSoundManager()
-      if (sm) sm.setSFXVolume(value)
-    }
-  )
-  settingsContainer.appendChild(sfxSection)
+  // Volumes and the master mute. The player name used to live here too; it is
+  // on the main menu now, next to the other pre-match choices.
+  const audioSection = createAudioSettings(settingsManager, getSoundManager)
+  settingsContainer.appendChild(audioSection)
 
   // Screen Shake Toggle
   const shakeSection = createToggleSetting(
@@ -228,6 +295,7 @@ export function createSettingsMenu(
   closeButton.style.fontSize = '14px'
   closeButton.style.padding = '15px 40px'
   closeButton.style.marginTop = '30px'
+  closeButton.style.flexShrink = '0'
   closeButton.style.cursor = 'pointer'
   closeButton.style.background = 'linear-gradient(180deg, #4ade80 0%, #22c55e 50%, #16a34a 100%)'
   closeButton.style.color = '#000'
@@ -264,91 +332,10 @@ export function createSettingsMenu(
   ;(settingsDiv as any).refresh = () => {
     const current = settingsManager.getSettings()
     ;(extendedPowerUpsSection as any).setValue?.(current.extendedPowerUps)
-    ;(playerNameSection as any).setValue?.(current.playerName)
+    audioSection.refresh?.()
   }
 
   return settingsDiv
-}
-
-/** Short free-text field with a live character counter. */
-function createTextSetting(
-  label: string,
-  initialValue: string,
-  placeholder: string,
-  maxLength: number,
-  onChange: (value: string) => void
-): HTMLDivElement {
-  const section = document.createElement('div')
-  section.style.marginBottom = '25px'
-
-  const labelDiv = document.createElement('div')
-  labelDiv.style.fontFamily = "'Russo One', sans-serif"
-  labelDiv.style.fontSize = '16px'
-  labelDiv.style.marginBottom = '12px'
-  labelDiv.style.display = 'flex'
-  labelDiv.style.justifyContent = 'space-between'
-  labelDiv.style.color = '#e5e5e5'
-
-  const labelText = document.createElement('span')
-  labelText.textContent = label
-
-  const counter = document.createElement('span')
-  counter.style.color = '#fbbf24'
-  counter.style.fontSize = '13px'
-  const updateCounter = (v: string) => {
-    counter.textContent = `${v.length}/${maxLength}`
-  }
-  updateCounter(initialValue)
-
-  labelDiv.appendChild(labelText)
-  labelDiv.appendChild(counter)
-
-  const input = document.createElement('input')
-  input.type = 'text'
-  input.value = initialValue
-  input.placeholder = placeholder
-  input.maxLength = maxLength
-  input.autocomplete = 'off'
-  input.spellcheck = false
-  input.style.width = '100%'
-  input.style.padding = '10px 12px'
-  input.style.borderRadius = '8px'
-  input.style.border = '2px solid #4b5563'
-  input.style.background = 'linear-gradient(180deg, #1a1a2e 0%, #0f0f1a 100%)'
-  input.style.color = 'white'
-  input.style.fontFamily = "'Russo One', sans-serif"
-  input.style.fontSize = '15px'
-  input.style.outline = 'none'
-
-  input.addEventListener('focus', () => {
-    input.style.border = '2px solid #3b82f6'
-    input.style.boxShadow = '0 0 10px rgba(59,130,246,0.4)'
-  })
-  input.addEventListener('blur', () => {
-    input.style.border = '2px solid #4b5563'
-    input.style.boxShadow = 'none'
-    // Snap the field to whatever actually got stored (trimmed / defaulted).
-    input.value = sanitizePlayerName(input.value)
-    updateCounter(input.value)
-  })
-  input.addEventListener('input', () => {
-    updateCounter(input.value)
-    onChange(input.value)
-  })
-  // The game listens on window for keys, so typing here would also drive the
-  // player. Menus are only open while paused, but stop propagation anyway.
-  input.addEventListener('keydown', (e) => e.stopPropagation())
-  input.addEventListener('keyup', (e) => e.stopPropagation())
-
-  ;(section as any).setValue = (value: string) => {
-    if (document.activeElement === input) return // don't fight the user mid-type
-    input.value = value
-    updateCounter(value)
-  }
-
-  section.appendChild(labelDiv)
-  section.appendChild(input)
-  return section
 }
 
 /** A row of mutually exclusive pill buttons, styled like the difficulty picker. */
@@ -633,6 +620,14 @@ function createSliderSetting(
   section.appendChild(labelDiv)
   section.appendChild(controlsRow)
   section.appendChild(sliderContainer)
+
+  // The pause menu and the settings screen show the same sliders, so either one
+  // has to be able to adopt a value the other stored — without firing onChange.
+  ;(section as any).setValue = (value: number) => {
+    const clamped = Math.max(0, Math.min(1, value))
+    if (clamped > 0) savedVolume = clamped
+    updateUI(clamped)
+  }
 
   return section
 }

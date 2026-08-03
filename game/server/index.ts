@@ -18,6 +18,7 @@ import {
 import { InMemoryLobbyStore, type LobbyStore } from './lobby-store.js'
 import {
   IDLE_LOBBY_TTL_MS,
+  RECONNECT_GRACE_MS,
   LobbyFullError,
   LobbyInProgressError,
   addPlayer,
@@ -47,7 +48,15 @@ const store: LobbyStore = new InMemoryLobbyStore()
 const app = express()
 
 app.get('/healthz', async (_req, res) => {
-  res.json({ ok: true, protocol: PROTOCOL_VERSION, lobbies: await store.size() })
+  res.json({
+    ok: true,
+    protocol: PROTOCOL_VERSION,
+    lobbies: await store.size(),
+    // Lobbies are per-process. Surfacing the instance makes a scale-out — where
+    // a code created on one worker is invisible on the other — diagnosable from
+    // outside instead of looking like a code that expired.
+    instance: process.env.WEBSITE_INSTANCE_ID?.slice(0, 8) ?? 'local',
+  })
 })
 
 // Hashed asset filenames are safe to cache hard; index.html must not be.
@@ -227,7 +236,11 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
       }
       const lobby = await store.get(message.code)
       if (!lobby) {
-        sendError(socket, 'lobby_not_found', 'No lobby with that code')
+        sendError(
+          socket,
+          'lobby_not_found',
+          'No lobby with that code — check the host is on this same site',
+        )
         return
       }
 
@@ -429,27 +442,34 @@ const sweep = setInterval(() => {
   void (async () => {
     const now = Date.now()
     for (const lobby of await store.values()) {
-      let changed = false
+      let rosterChanged = false
 
       for (const player of [...lobby.players]) {
         if (
           !player.connected &&
           player.disconnectedAt !== null &&
-          now - player.disconnectedAt > 30_000
+          now - player.disconnectedAt > RECONNECT_GRACE_MS
         ) {
           removePlayer(lobby, player.id)
-          changed = true
+          rosterChanged = true
         }
       }
 
-      if (lobby.players.length === 0 || now - lobby.updatedAt > IDLE_LOBBY_TTL_MS) {
+      // `updatedAt` only moves on a mutation, so a host sitting in an open
+      // lobby waiting for friends looks idle. Expiring on that alone deleted
+      // lobbies out from under people who were still connected and watching the
+      // code on screen — the joiner then got "no lobby with that code" for a
+      // code that was, from the host's side, plainly still there. A lobby is
+      // only ever reaped once nobody is connected to it.
+      const occupied = lobby.players.some(p => p.connected)
+      if (!occupied && (lobby.players.length === 0 || now - lobby.updatedAt > IDLE_LOBBY_TTL_MS)) {
         await store.delete(lobby.code)
         continue
       }
-      if (changed) {
-        await store.set(lobby.code, lobby)
-        broadcastLobby(lobby)
-      }
+      if (occupied) lobby.updatedAt = now
+
+      await store.set(lobby.code, lobby)
+      if (rosterChanged) broadcastLobby(lobby)
     }
   })()
 }, 15_000)

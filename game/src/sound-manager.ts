@@ -2,27 +2,44 @@
  * SoundManager — uses the Web Audio API directly (no Babylon.js audio dependency).
  * This avoids tree-shaking issues with Babylon's audio engine in v8.x.
  */
+/**
+ * Sounds that belong to the interface rather than the game world, and so run on
+ * their own volume bus. Adding a new menu sound only means listing it here.
+ */
+const UI_SOUNDS = new Set(['menu-select', 'menu-click'])
+
 export class SoundManager {
   private sounds: Map<string, AudioBuffer> = new Map()
   private musicSounds: Set<string> = new Set()
   private ctx: AudioContext
   private musicVolume: number = 0.2
   private sfxVolume: number = 0.7
+  private uiVolume: number = 0.6
   private currentMusicSource: AudioBufferSourceNode | null = null
+  /** Everything routes through here, so mute-all never touches the sliders. */
+  private masterGain: GainNode
   private musicGain: GainNode
   private sfxGain: GainNode
+  private uiGain: GainNode
+  private muted = false
   private musicReadyInterval: ReturnType<typeof setInterval> | null = null
   private musicReadyTimeout: ReturnType<typeof setTimeout> | null = null
 
   constructor() {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext
     this.ctx = new AudioCtx()
+    this.masterGain = this.ctx.createGain()
+    this.masterGain.gain.value = 1
+    this.masterGain.connect(this.ctx.destination)
     this.musicGain = this.ctx.createGain()
     this.musicGain.gain.value = this.musicVolume
-    this.musicGain.connect(this.ctx.destination)
+    this.musicGain.connect(this.masterGain)
     this.sfxGain = this.ctx.createGain()
     this.sfxGain.gain.value = this.sfxVolume
-    this.sfxGain.connect(this.ctx.destination)
+    this.sfxGain.connect(this.masterGain)
+    this.uiGain = this.ctx.createGain()
+    this.uiGain.gain.value = this.uiVolume
+    this.uiGain.connect(this.masterGain)
   }
 
   /** Unlock AudioContext (must be called from a user-gesture call stack). */
@@ -44,14 +61,14 @@ export class SoundManager {
       .catch(() => { /* keep placeholder if file missing */ })
   }
 
-  /** Play a one-shot SFX (allows overlapping). */
+  /** Play a one-shot SFX (allows overlapping). Menu sounds use the UI bus. */
   playSFX(name: string) {
     const buffer = this.sounds.get(name)
     if (!buffer) return
     try {
       const src = this.ctx.createBufferSource()
       src.buffer = buffer
-      src.connect(this.sfxGain)
+      src.connect(UI_SOUNDS.has(name) ? this.uiGain : this.sfxGain)
       src.start(0)
     } catch { /* ignore */ }
   }
@@ -108,6 +125,21 @@ export class SoundManager {
   setSFXVolume(volume: number) {
     this.sfxVolume = Math.max(0, Math.min(1, volume))
     this.sfxGain.gain.value = this.sfxVolume
+  }
+
+  setUIVolume(volume: number) {
+    this.uiVolume = Math.max(0, Math.min(1, volume))
+    this.uiGain.gain.value = this.uiVolume
+  }
+
+  /** Silence everything without disturbing the individual volume settings. */
+  setMuted(muted: boolean) {
+    this.muted = muted
+    this.masterGain.gain.value = muted ? 0 : 1
+  }
+
+  isMuted(): boolean {
+    return this.muted
   }
 
   /** Generate procedural placeholder sounds as WAV → AudioBuffer. */

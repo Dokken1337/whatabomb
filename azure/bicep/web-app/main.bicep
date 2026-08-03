@@ -105,6 +105,11 @@ module webApp 'br/public:avm/res/web/site:0.24.0' = {
       http20Enabled: true
       minTlsVersion: '1.2'
       ftpsState: 'FtpsOnly'
+      // Lobbies are held in the server process's memory, so a second instance
+      // would host a second, invisible set of them and a shared code would
+      // resolve on one worker and not the other. Pinned to one worker until the
+      // store is backed by something shared (see server/lobby-store.ts).
+      numberOfWorkers: 1
     }
     configs: [
       {

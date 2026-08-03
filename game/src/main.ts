@@ -30,7 +30,7 @@ import { createMainMenu, createPauseMenu, showCountdown, type GameMode } from '.
 import { SoundManager } from './sound-manager'
 import { StatisticsManager } from './statistics'
 import { SettingsManager, sanitizePlayerName, PLAYER_COLORS } from './settings'
-import { createSettingsMenu } from './settings-menu'
+import { createSettingsMenu, createAudioSettings } from './settings-menu'
 import { createStatsScreen } from './stats-screen'
 import { GameStateManager } from './game-state'
 import { getDifficultyConfig, getWaveScaling, type DifficultyConfig } from './difficulty'
@@ -213,42 +213,81 @@ interface NetPlayer {
   inputSeq: number
 }
 
-function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext): Scene {
-  const scene = new Scene(engine)
-  
-  // Update grid size from map config
-  GRID_WIDTH = currentMapConfig.gridWidth
-  GRID_HEIGHT = currentMapConfig.gridHeight
-  
-  // Initialize sound manager
-  soundManager = new SoundManager()
-  soundManager.createPlaceholderSounds()
-  
+/**
+ * One SoundManager for the whole session.
+ *
+ * It used to be rebuilt on every scene, which leaked an AudioContext per match
+ * (browsers cap those) and left the menus silent until a game had been played
+ * at least once — so the interface volume had nothing to act on where the
+ * interface sounds actually live.
+ */
+function ensureSoundManager(): SoundManager {
+  if (soundManager) return soundManager
+
+  const manager = new SoundManager()
+  soundManager = manager
+  manager.createPlaceholderSounds()
+
   // Load all sound effect files (WAV format)
   try {
-    soundManager.loadSound('bomb-place', '/sounds/bomb-place.wav', { volume: 0.5 })
-    soundManager.loadSound('explosion', '/sounds/explosion.wav', { volume: 0.6 })
-    soundManager.loadSound('powerup', '/sounds/powerup.wav', { volume: 0.5 })
-    soundManager.loadSound('victory', '/sounds/victory.wav', { volume: 0.7 })
-    soundManager.loadSound('defeat', '/sounds/defeat.wav', { volume: 0.7 })
-    soundManager.loadSound('game-start', '/sounds/game-start.wav', { volume: 0.6 })
-    soundManager.loadSound('death', '/sounds/death.wav', { volume: 0.6 })
-    soundManager.loadSound('menu-select', '/sounds/menu-select.wav', { volume: 0.4 })
-    soundManager.loadSound('menu-click', '/sounds/menu-click.wav', { volume: 0.5 })
-    soundManager.loadSound('kick', '/sounds/kick.wav', { volume: 0.5 })
-    soundManager.loadSound('throw', '/sounds/throw.wav', { volume: 0.5 })
-    soundManager.loadSound('countdown-tick', '/sounds/countdown-tick.wav', { volume: 0.5 })
-    soundManager.loadSound('bgm', '/sounds/bgm.wav', { loop: true, isMusic: true })
+    manager.loadSound('bomb-place', '/sounds/bomb-place.wav', { volume: 0.5 })
+    manager.loadSound('explosion', '/sounds/explosion.wav', { volume: 0.6 })
+    manager.loadSound('powerup', '/sounds/powerup.wav', { volume: 0.5 })
+    manager.loadSound('victory', '/sounds/victory.wav', { volume: 0.7 })
+    manager.loadSound('defeat', '/sounds/defeat.wav', { volume: 0.7 })
+    manager.loadSound('game-start', '/sounds/game-start.wav', { volume: 0.6 })
+    manager.loadSound('death', '/sounds/death.wav', { volume: 0.6 })
+    manager.loadSound('menu-select', '/sounds/menu-select.wav', { volume: 0.4 })
+    manager.loadSound('menu-click', '/sounds/menu-click.wav', { volume: 0.5 })
+    manager.loadSound('kick', '/sounds/kick.wav', { volume: 0.5 })
+    manager.loadSound('throw', '/sounds/throw.wav', { volume: 0.5 })
+    manager.loadSound('countdown-tick', '/sounds/countdown-tick.wav', { volume: 0.5 })
+    manager.loadSound('bgm', '/sounds/bgm.wav', { loop: true, isMusic: true })
   } catch (e) {
     console.log('Sound files not found - run: node scripts/generate-sounds.js')
   }
-  
-  // Apply settings
+
+  applyAudioSettings()
+  return manager
+}
+
+/** Push the stored volumes and the master mute onto the live audio graph. */
+function applyAudioSettings(): void {
+  if (!soundManager) return
   const settings = settingsManager.getSettings()
-  if (soundManager) {
-    soundManager.setMusicVolume(settings.musicVolume)
-    soundManager.setSFXVolume(settings.sfxVolume)
-  }
+  soundManager.setMusicVolume(settings.musicVolume)
+  soundManager.setSFXVolume(settings.sfxVolume)
+  soundManager.setUIVolume(settings.uiVolume)
+  soundManager.setMuted(settings.muteAll)
+}
+
+/**
+ * The arena every online match is played on.
+ *
+ * Map choice is a local setting, and its default even varies by device — phones
+ * start on the 13x13 small map, desktops on the 17x17 classic one. The shared
+ * seed only guarantees an identical arena when the grid dimensions and theme
+ * match too, so a desktop host and a phone guest were building different boards
+ * and every coordinate on the wire meant something different on each screen:
+ * blasts, crates and power-ups all landed on the wrong tiles, and anything past
+ * the smaller grid's edge was drawn off the board entirely.
+ *
+ * Pinning one map for online play makes the seed sufficient again.
+ */
+const ONLINE_MAP_KEY = 'medium-classic'
+
+function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext): Scene {
+  const scene = new Scene(engine)
+
+  // Update grid size from map config
+  const mapConfig = online ? getMapConfig(ONLINE_MAP_KEY) : currentMapConfig
+  GRID_WIDTH = mapConfig.gridWidth
+  GRID_HEIGHT = mapConfig.gridHeight
+
+  ensureSoundManager()
+  applyAudioSettings()
+
+  const settings = settingsManager.getSettings()
   // The "Particle Effects" toggle previously had no effect at all.
   setParticlesEnabled(settings.particles)
   const particlesOn = settings.particles
@@ -315,18 +354,20 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   const halfWorldWidth = (GRID_WIDTH * TILE_SIZE) / 2
   const halfWorldHeight = (GRID_HEIGHT * TILE_SIZE) / 2
   
-  // Mobile zoom adjustment: Reduce the visible area slightly to make everything bigger
-  // A zoom factor < 1.0 means zooming in (showing less area)
-  // A zoom factor > 1.0 means zooming out (showing more area)
-  // User feedback V1.1: "Increase area of game a bit to get a bit more out of display"
-  // Previous V1.0 was 0.6. Increasing to 0.75 to show more area.
-  // User feedback V1.2: "Adjust the game area a bit more" -> Increasing to 0.85
-  // For larger maps on mobile, zoom in more (0.75) to make tiles bigger
-  
+  // How much of the arena the camera shows. Below 1.0 the board is cropped and
+  // the camera pans to follow the player.
+  //
+  // Phones used to crop to 0.85 (0.70 on big maps) to make tiles bigger. That
+  // is what "zoomed in" meant: the board's left and right edges were simply off
+  // screen. Now that the framing below corrects for the viewport aspect there is
+  // vertical room to spare on a portrait phone, so cropping horizontally bought
+  // nothing — the whole arena fits at full width. Only genuinely large arenas
+  // still crop, because fitting a 21-wide board across a phone leaves tiles too
+  // small to aim at.
   let zoomFactor = 1.0
-  if (isMobile()) {
-    zoomFactor = isLargeMap ? 0.70 : 0.85
-  } 
+  if (isMobile() && maxDimension > 17) {
+    zoomFactor = 0.8
+  }
   
   // Breathing room around the arena. Kept tight on desktop so the board claims
   // as much of the window height as it can — the square arena is height-bound
@@ -352,14 +393,15 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /**
    * Fit the arena into the canvas.
    *
-   * On desktop the ortho box used to be set to fixed world extents regardless
-   * of the window shape, so a square arena came out visibly stretched — wider
-   * than tall on any landscape window, and the distortion changed as the window
-   * was resized. The box is now grown along whichever axis has room to spare,
-   * which keeps tiles square and lets the board claim the full window height.
+   * An orthographic box maps straight onto the viewport, so unless its aspect
+   * matches the canvas the world is scaled unevenly and square tiles come out
+   * as rectangles. The box is grown — never shrunk — along whichever axis has
+   * room to spare, which keeps tiles square without ever cropping more of the
+   * arena than the zoom factor already intends.
    *
-   * Mobile keeps its original framing: that layout is deliberately tuned around
-   * the reserved control strip below the board and the camera-follow clamp.
+   * This used to run on desktop only. Phones were left with a fixed box whose
+   * aspect had nothing to do with the screen, which on a tall portrait display
+   * stretched every tile roughly 1.5x vertically.
    */
   function applyCameraFraming() {
     let left = -viewportHalfWidth
@@ -367,25 +409,23 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     let top = frameTop
     let bottom = frameBottom
 
-    if (!isMobile()) {
-      const renderWidth = engine.getRenderWidth() || 1
-      const renderHeight = engine.getRenderHeight() || 1
-      const canvasAspect = renderWidth / renderHeight
-      const contentAspect = (right - left) / (top - bottom)
+    const renderWidth = engine.getRenderWidth() || 1
+    const renderHeight = engine.getRenderHeight() || 1
+    const canvasAspect = renderWidth / renderHeight
+    const contentAspect = (right - left) / (top - bottom)
 
-      if (canvasAspect > contentAspect) {
-        // Extra horizontal room — grow sideways.
-        const centerX = (left + right) / 2
-        const halfWidth = ((top - bottom) * canvasAspect) / 2
-        left = centerX - halfWidth
-        right = centerX + halfWidth
-      } else {
-        // Extra vertical room — grow up and down.
-        const centerY = (top + bottom) / 2
-        const halfHeight = ((right - left) / canvasAspect) / 2
-        top = centerY + halfHeight
-        bottom = centerY - halfHeight
-      }
+    if (canvasAspect > contentAspect) {
+      // Extra horizontal room — grow sideways.
+      const centerX = (left + right) / 2
+      const halfWidth = ((top - bottom) * canvasAspect) / 2
+      left = centerX - halfWidth
+      right = centerX + halfWidth
+    } else {
+      // Extra vertical room — grow up and down.
+      const centerY = (top + bottom) / 2
+      const halfHeight = ((right - left) / canvasAspect) / 2
+      top = centerY + halfHeight
+      bottom = centerY - halfHeight
     }
 
     camera.orthoLeft = left
@@ -490,7 +530,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   // Materials (using map theme colors)
   // Materials (using map theme colors) — only create materials actually used
   const wallMaterial = new StandardMaterial('wallMat', scene)
-  wallMaterial.diffuseColor = currentMapConfig.colors.wall
+  wallMaterial.diffuseColor = mapConfig.colors.wall
   wallMaterial.specularColor = new Color3(0.1, 0.1, 0.1)
   wallMaterial.specularPower = 32
 
@@ -499,7 +539,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   // Online matches pass the server's seed so every client builds the identical
   // arena; offline play stays random.
   const generated = generateMap(
-    GRID_WIDTH, GRID_HEIGHT, currentMapConfig.theme, paddingBottom, online?.seed,
+    GRID_WIDTH, GRID_HEIGHT, mapConfig.theme, paddingBottom, online?.seed,
   )
   const grid = generated.grid
 
@@ -518,7 +558,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   }
 
   // Create crate/barrel texture (theme-specific)
-  const theme = currentMapConfig.theme
+  const theme = mapConfig.theme
   const createDestructibleTexture = (theme: string) => {
     return createTexture('#8B4513', (ctx) => {
       const w = 128, h = 128
@@ -955,10 +995,10 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     })
   }
 
-  const floorTexture = createFloorTexture(currentMapConfig.theme)
+  const floorTexture = createFloorTexture(mapConfig.theme)
 
   // Create shared tile materials (2 for checkered pattern) instead of one per tile
-  const baseColor = currentMapConfig.colors.ground
+  const baseColor = mapConfig.colors.ground
   const tileMatLight = new StandardMaterial('tileMat-light', scene)
   tileMatLight.diffuseTexture = floorTexture
   tileMatLight.diffuseColor = baseColor
@@ -4984,8 +5024,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   /** Keep the camera on a target, clamped so it never shows outside the arena. */
   function followCamera(targetX: number, targetZ: number): void {
-    const minX = -halfWorldWidth - margin + viewportHalfWidth
-    const maxX = halfWorldWidth + margin - viewportHalfWidth
+    // Read the horizontal extent back off the camera: aspect correction can
+    // widen the box past viewportHalfWidth, and panning to a stale, narrower
+    // limit would scroll empty space in from the side.
+    const visibleHalfWidth = (camera.orthoRight! - camera.orthoLeft!) / 2
+    const minX = -halfWorldWidth - margin + visibleHalfWidth
+    const maxX = halfWorldWidth + margin - visibleHalfWidth
     const minZ = -halfWorldHeight - margin + viewportHalfHeight
     const maxZ = halfWorldHeight + margin - viewportHalfHeight
 
@@ -5016,6 +5060,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   const SNAPSHOT_INTERVAL_MS = 66 // ~15Hz
   const ONLINE_TICK_MS = 33 // ~30Hz simulation, independent of frame rate
+  /** How long the host lets the final explosion play before ending the round. */
+  const ROUND_OVER_GRACE_MS = 1300
 
   /** Can this networked player step onto the tile? */
   function netCanWalk(np: NetPlayer, tx: number, ty: number): boolean {
@@ -5301,13 +5347,30 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       meshes.forEach(m => { if (!m.isDisposed()) m.dispose() })
     }, cleanupMs)
   }
-  /** Round ends when at most one player is standing. Host reports the result. */
+  /**
+   * Round ends when at most one player is standing. Host reports the result.
+   *
+   * The report is held back for a beat. `roundOver` makes every client dispose
+   * its arena on the spot, and the blast that just decided the round is still
+   * sitting in `pendingBlasts` waiting for the next snapshot — so reporting
+   * immediately tore guests down on the frame *before* the explosion, which
+   * read as the game freezing rather than as a death.
+   */
   function checkNetRoundOver(): void {
     if (!online || !online.isHost || roundReported) return
     const alive = netPlayers.filter(p => p.alive)
     if (alive.length > 1) return
     roundReported = true
-    online.net.send({ t: 'roundResult', winnerId: alive.length === 1 ? alive[0].id : null })
+
+    const net = online.net
+    const winnerId = alive.length === 1 ? alive[0].id : null
+
+    // Push the killing blast and the death out now, ahead of the result.
+    net.send({ t: 'state', tick: Date.now(), payload: buildSnapshot() })
+    lastSnapshotAt = Date.now()
+
+    const timer = setTimeout(() => net.send({ t: 'roundResult', winnerId }), ROUND_OVER_GRACE_MS)
+    scene.onDisposeObservable.add(() => clearTimeout(timer))
   }
 
   /**
@@ -5342,7 +5405,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
       checkNetRoundOver()
 
-      if (now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS) {
+      // Blasts and crate removals are one-shot events, not state: they are
+      // carried by exactly one snapshot and are gone from the next. Waiting out
+      // the interval delays every remote explosion by up to a frame's worth of
+      // fuse, so send as soon as there is an event to carry.
+      const hasEvents = pendingBlasts.length > 0 || pendingCleared.length > 0
+      if (hasEvents || now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS) {
         lastSnapshotAt = now
         online.net.send({ t: 'state', tick: now, payload: buildSnapshot() })
       }
@@ -5533,10 +5601,15 @@ function startGame(mode: GameMode, online?: OnlineContext) {
     powerPreference: 'high-performance',
     doNotHandleContextLost: true,
   })
-  // Cap the render resolution on very dense displays — a 3x DPR phone would
-  // otherwise shade nine times as many pixels for no visible gain.
+  // Render at the display's real pixel density, capped at 2x.
+  //
+  // Babylon's hardware scaling level divides the CSS size to get the backbuffer
+  // size, so it is the inverse of a device ratio: 0.5 means "two device pixels
+  // per CSS pixel". The old `dpr / 2` therefore did the opposite of what it
+  // meant — on a 3x phone it rendered at two thirds of CSS resolution, which the
+  // display then blew up 4.5x. That is the mobile blur.
   const dpr = window.devicePixelRatio || 1
-  if (onPhone && dpr > 2) currentEngine.setHardwareScalingLevel(dpr / 2)
+  currentEngine.setHardwareScalingLevel(1 / Math.min(dpr, 2))
 
   currentScene = createScene(currentEngine, mode, online)
   
@@ -5596,16 +5669,18 @@ function toggleFullscreen() {
 }
 
 // Create pause menu
-const pauseMenu = createPauseMenu(
-  () => {
-    // Resume
+const pauseMenu = createPauseMenu({
+  audioPanel: createAudioSettings(settingsManager, () => ensureSoundManager()),
+  onResume: () => {
     isPaused = false
     pauseMenu.style.display = 'none'
+    ;(pauseMenu as any).collapseAudio?.()
   },
-  () => {
+  onQuit: () => {
     // Quit to menu
     isPaused = false
     pauseMenu.style.display = 'none'
+    ;(pauseMenu as any).collapseAudio?.()
     mainMenu.style.display = 'flex'
 
     if (soundManager) soundManager.stopMusic()
@@ -5630,14 +5705,14 @@ const pauseMenu = createPauseMenu(
         el.remove()
       }
     })
-  }
-)
+  },
+})
 document.body.appendChild(pauseMenu)
 
 // Create settings menu
 const settingsMenu = createSettingsMenu(
   settingsManager,
-  () => soundManager,
+  () => ensureSoundManager(),
   () => {
     settingsMenu.style.display = 'none'
     mainMenu.style.display = 'flex'
@@ -5665,6 +5740,11 @@ const mainMenu = createMainMenu({
   },
   getExtendedPowerUps: () => settingsManager.getSettings().extendedPowerUps,
   onToggleExtendedPowerUps: (enabled) => settingsManager.setExtendedPowerUps(enabled),
+  getPlayerName: () => sanitizePlayerName(settingsManager.getSettings().playerName),
+  onApplyPlayerName: (name) => {
+    settingsManager.setPlayerName(name)
+    return settingsManager.getSettings().playerName
+  },
 })
 document.body.appendChild(mainMenu)
 
@@ -5810,14 +5890,19 @@ document.body.appendChild(lobbyScreen)
 document.addEventListener('mouseenter', (e) => {
   const target = e.target as HTMLElement
   if (target.tagName === 'BUTTON' && (target.closest('.menu-container') || target.closest('#main-menu'))) {
-    if (soundManager) soundManager.playSFX('menu-select')
+    soundManager?.playSFX('menu-select')
   }
 }, true)
 
 document.addEventListener('click', (e) => {
   const target = e.target as HTMLElement
   if (target.tagName === 'BUTTON' && (target.closest('.menu-container') || target.closest('#main-menu'))) {
-    if (soundManager) soundManager.playSFX('menu-click')
+    // A click is a user gesture, which is the only moment an AudioContext can
+    // be unlocked — so the menus get their own sound rather than staying mute
+    // until the first match has been played.
+    const manager = ensureSoundManager()
+    manager.resumeAudio()
+    manager.playSFX('menu-click')
   }
 }, true)
 

@@ -1,4 +1,5 @@
 import { isMobile, isIOS } from './device'
+import { MAX_PLAYER_NAME_LENGTH } from './settings'
 
 export type GameMode = '1v1' | '1v2' | '1v3' | 'pvp' | 'time-attack' | 'survival'
 
@@ -10,6 +11,10 @@ export interface MenuOptions {
   getExtendedPowerUps: () => boolean
   /** Persist a new Extended Power-Ups state. */
   onToggleExtendedPowerUps: (enabled: boolean) => void
+  /** Current player name, shown on the HUD and to other players online. */
+  getPlayerName: () => string
+  /** Persist a new player name. Returns the value that was actually stored. */
+  onApplyPlayerName: (name: string) => string
 }
 
 // Countdown before game starts
@@ -148,14 +153,20 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   menuDiv.style.height = '100vh'
   menuDiv.style.display = 'flex'
   menuDiv.style.flexDirection = 'column'
-  // Use justify-content: flex-start with auto margin/padding to handle both small and large screens safely
+  // flex-start rather than centre: a centred flex column clips its own top once
+  // the content outgrows the viewport, which would put the title out of reach on
+  // the small screens that actually need to scroll. `margin: auto 0` on the
+  // content instead centres it whenever there *is* room to spare.
   menuDiv.style.justifyContent = 'flex-start'
   menuDiv.style.alignItems = 'center'
-  menuDiv.style.paddingTop = '50px' // Ensure breathing room at top
-  menuDiv.style.paddingBottom = '50px' // Ensure breathing room at bottom
-  menuDiv.style.overflowY = 'auto' // Allow vertical scrolling on all devices
+  // Spacing is deliberately tight. Everything below has to clear a laptop
+  // viewport — roughly 700px once browser chrome is subtracted — without a
+  // scrollbar; the media queries in style.css take over below that.
+  menuDiv.style.paddingTop = '20px'
+  menuDiv.style.paddingBottom = '20px'
+  menuDiv.style.overflowY = 'auto' // Only actually scrolls on short screens
   menuDiv.style.boxSizing = 'border-box'
-  
+
   menuDiv.style.zIndex = '2000'
   menuDiv.style.fontFamily = "'Russo One', sans-serif"
   menuDiv.style.color = 'white'
@@ -163,17 +174,19 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   const title = document.createElement('h1')
   title.innerHTML = "💣 WHAT'A BOMB! 💣"
   title.className = 'menu-title'
-  title.style.fontSize = '42px'
-  title.style.marginBottom = '40px'
+  // Scales with the window for the same reason the buttons do.
+  title.style.fontSize = 'clamp(26px, 4.4vh, 44px)'
+  title.style.marginTop = 'auto'
+  title.style.marginBottom = 'clamp(8px, 1.4vh, 16px)'
   menuDiv.appendChild(title)
-  
+
   // Subtitle
   const subtitle = document.createElement('p')
-  subtitle.textContent = 'By Fredrik, V10.0.0'
-  subtitle.style.fontSize = '16px'
+  subtitle.textContent = 'By Fredrik, V10.1.0'
+  subtitle.style.fontSize = 'clamp(12px, 1.6vh, 16px)'
   subtitle.style.color = '#aaa'
-  subtitle.style.marginTop = '-30px'
-  subtitle.style.marginBottom = '30px'
+  subtitle.style.marginTop = '0'
+  subtitle.style.marginBottom = 'clamp(8px, 1.5vh, 16px)'
   subtitle.style.letterSpacing = '2px'
   menuDiv.appendChild(subtitle)
 
@@ -198,19 +211,19 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
 
   // Button container for game modes
   const modeContainer = document.createElement('div')
+  modeContainer.className = 'mode-buttons'
   modeContainer.style.display = 'flex'
   modeContainer.style.flexDirection = 'column'
   modeContainer.style.alignItems = 'center'
-  modeContainer.style.gap = '5px'
-  
+  modeContainer.style.gap = '4px'
+
   modes.forEach(({ mode, label, icon }) => {
     const button = document.createElement('button')
     button.innerHTML = `${icon} ${label}`
     button.className = 'menu-button'
-    button.style.fontSize = '18px'
-    button.style.padding = '14px 50px'
-    button.style.margin = '6px'
-    button.style.width = '320px'
+    // Size, padding and width are set by #main-menu .menu-button in style.css —
+    // the base .menu-button rule declares those with !important, so setting them
+    // inline here has no effect.
     button.style.cursor = 'pointer'
     button.style.background = 'linear-gradient(180deg, #4CAF50 0%, #388E3C 100%)'
     button.style.color = 'white'
@@ -263,9 +276,12 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   buttonContainer.style.gap = '12px'
   // Tighter than the gap above the power-up toggle, so the toggle reads as
   // part of the match setup rather than as one of the utility buttons.
-  buttonContainer.style.marginTop = '18px'
+  buttonContainer.style.marginTop = '14px'
+  buttonContainer.style.marginBottom = 'auto'
   buttonContainer.style.flexWrap = 'wrap'
   buttonContainer.style.justifyContent = 'center'
+  // Wide enough to hold the seven utility buttons in two rows rather than three.
+  buttonContainer.style.maxWidth = 'min(880px, 94vw)'
 
   // Fullscreen is offered everywhere except iOS, where Safari only exposes the
   // Fullscreen API for video/audio elements.
@@ -307,6 +323,71 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
     buttonContainer.appendChild(button)
   })
 
+  // Player name. It used to live in Settings, but it is a pre-match choice like
+  // the power-up toggle below it — and online it is how everyone else sees you,
+  // so it belongs where you pick a mode. Applied explicitly rather than on every
+  // keystroke, so a half-typed name never reaches the lobby.
+  const nameRow = document.createElement('div')
+  nameRow.style.display = 'flex'
+  nameRow.style.justifyContent = 'center'
+  nameRow.style.marginTop = '16px'
+
+  const nameBox = document.createElement('div')
+  nameBox.className = 'name-box'
+  nameBox.id = 'player-name-box'
+
+  const nameLabel = document.createElement('span')
+  nameLabel.className = 'nb-label'
+  nameLabel.textContent = '🙋 Name'
+
+  const nameInput = document.createElement('input')
+  nameInput.className = 'nb-input'
+  nameInput.id = 'player-name-input'
+  nameInput.type = 'text'
+  nameInput.maxLength = MAX_PLAYER_NAME_LENGTH
+  nameInput.autocomplete = 'off'
+  nameInput.spellcheck = false
+  nameInput.value = options.getPlayerName()
+  nameInput.setAttribute('aria-label', 'Player name')
+  // The game listens for keys on window; keep typing out of the player controls.
+  nameInput.addEventListener('keydown', e => {
+    e.stopPropagation()
+    if (e.key === 'Enter') applyName()
+  })
+  nameInput.addEventListener('keyup', e => e.stopPropagation())
+
+  const applyButton = document.createElement('button')
+  applyButton.className = 'nb-apply'
+  applyButton.id = 'player-name-apply'
+  applyButton.textContent = 'APPLY'
+
+  let applyResetTimer: ReturnType<typeof setTimeout> | null = null
+  function applyName(): void {
+    const stored = options.onApplyPlayerName(nameInput.value)
+    // Snap the field to what was actually saved, so a trimmed or empty entry
+    // does not leave the box disagreeing with the game.
+    nameInput.value = stored
+    nameInput.blur()
+    applyButton.textContent = 'SAVED'
+    nameBox.classList.add('is-saved')
+    if (applyResetTimer) clearTimeout(applyResetTimer)
+    applyResetTimer = setTimeout(() => {
+      applyButton.textContent = 'APPLY'
+      nameBox.classList.remove('is-saved')
+    }, 1400)
+  }
+  applyButton.addEventListener('click', applyName)
+
+  nameBox.append(nameLabel, nameInput, applyButton)
+  nameRow.appendChild(nameBox)
+  menuDiv.appendChild(nameRow)
+
+  // Keep in sync if the name is changed elsewhere (or reloaded from storage).
+  ;(menuDiv as any).refreshPlayerName = () => {
+    if (document.activeElement === nameInput) return // don't fight a live edit
+    nameInput.value = options.getPlayerName()
+  }
+
   // Extended Power-Ups quick toggle — the same setting as in the Settings
   // screen, surfaced here because it changes how a whole match plays.
   // Appended before the secondary buttons so it sits directly under the game
@@ -314,7 +395,8 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   const powerUpToggleRow = document.createElement('div')
   powerUpToggleRow.style.display = 'flex'
   powerUpToggleRow.style.justifyContent = 'center'
-  powerUpToggleRow.style.marginTop = '22px'
+  // Tight against the name box above — the two read as one pre-match strip.
+  powerUpToggleRow.style.marginTop = '10px'
 
   const powerUpToggle = document.createElement('button')
   powerUpToggle.id = 'extended-powerups-toggle'
@@ -354,7 +436,19 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
   return menuDiv
 }
 
-export function createPauseMenu(onResume: () => void, onQuit: () => void): HTMLDivElement {
+export interface PauseMenuOptions {
+  onResume: () => void
+  onQuit: () => void
+  /**
+   * Volume controls to show behind the Audio button. Built by the caller so
+   * this module stays free of settings plumbing; the panel is refreshed each
+   * time it is opened because the same controls exist on the Settings screen.
+   */
+  audioPanel?: HTMLElement & { refresh?: () => void }
+}
+
+export function createPauseMenu(options: PauseMenuOptions): HTMLDivElement {
+  const { onResume, onQuit, audioPanel } = options
   const pauseDiv = document.createElement('div')
   pauseDiv.id = 'pause-menu'
   pauseDiv.className = 'menu-container'
@@ -372,6 +466,11 @@ export function createPauseMenu(onResume: () => void, onQuit: () => void): HTMLD
   pauseDiv.style.fontFamily = "'Russo One', sans-serif"
   pauseDiv.style.color = 'white'
   pauseDiv.style.backdropFilter = 'blur(5px)'
+  // The audio panel can push past the viewport on a short screen; scroll rather
+  // than clipping the Quit button.
+  pauseDiv.style.overflowY = 'auto'
+  pauseDiv.style.padding = '20px'
+  pauseDiv.style.boxSizing = 'border-box'
 
   const title = document.createElement('h2')
   title.textContent = '⏸️ PAUSED'
@@ -407,6 +506,55 @@ export function createPauseMenu(onResume: () => void, onQuit: () => void): HTMLD
   })
   resumeButton.addEventListener('click', onResume)
   pauseDiv.appendChild(resumeButton)
+
+  // Audio, in reach without abandoning the match. Only the volumes are exposed:
+  // the rest of Settings changes how a game plays and would be unfair to alter
+  // halfway through one.
+  if (audioPanel) {
+    const audioButton = document.createElement('button')
+    audioButton.id = 'pause-audio-button'
+    audioButton.innerHTML = '🔊 Audio'
+    audioButton.className = 'menu-button'
+    audioButton.style.fontSize = '20px'
+    audioButton.style.padding = '15px 50px'
+    audioButton.style.margin = '10px'
+    audioButton.style.cursor = 'pointer'
+    audioButton.style.background = 'linear-gradient(180deg, #546E7A 0%, #37474F 100%)'
+    audioButton.style.color = 'white'
+    audioButton.style.border = '3px solid #263238'
+    audioButton.style.borderRadius = '8px'
+    audioButton.style.fontFamily = "'Russo One', sans-serif"
+    audioButton.style.boxShadow = '0 4px 0 #1a252a, 0 6px 10px rgba(0,0,0,0.3)'
+    audioButton.style.transition = 'all 0.2s ease'
+    audioButton.addEventListener('mouseenter', () => {
+      audioButton.style.transform = 'translateY(-2px)'
+      audioButton.style.background = 'linear-gradient(180deg, #607D8B 0%, #546E7A 100%)'
+    })
+    audioButton.addEventListener('mouseleave', () => {
+      audioButton.style.transform = 'translateY(0)'
+      audioButton.style.background = 'linear-gradient(180deg, #546E7A 0%, #37474F 100%)'
+    })
+    pauseDiv.appendChild(audioButton)
+
+    const audioWrap = document.createElement('div')
+    audioWrap.className = 'pause-audio-panel'
+    audioWrap.style.display = 'none'
+    audioWrap.appendChild(audioPanel)
+    pauseDiv.appendChild(audioWrap)
+
+    audioButton.addEventListener('click', () => {
+      const opening = audioWrap.style.display === 'none'
+      audioWrap.style.display = opening ? 'block' : 'none'
+      audioButton.innerHTML = opening ? '🔊 Audio ▲' : '🔊 Audio'
+      if (opening) audioPanel.refresh?.()
+    })
+
+    // Always start collapsed, so pausing goes straight back to Resume.
+    ;(pauseDiv as any).collapseAudio = () => {
+      audioWrap.style.display = 'none'
+      audioButton.innerHTML = '🔊 Audio'
+    }
+  }
 
   const quitButton = document.createElement('button')
   quitButton.innerHTML = '🚪 Quit to Menu'

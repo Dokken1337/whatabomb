@@ -25,6 +25,10 @@ body {
 #app {
   width: 100vw;
   height: 100vh;
+  /* Mobile browsers count the collapsible address bar in 100vh, so the canvas
+     was taller than the screen and the bottom of the board sat under the fold.
+     dvh tracks the space actually on screen; the 100vh above is the fallback. */
+  height: 100dvh;
   overflow: hidden;
   position: fixed;
   top: 0;
@@ -39,14 +43,6 @@ body {
   display: block;
   touch-action: none;
   -webkit-touch-callout: none;
-}
-
-/* Mobile canvas sizing - ensure larger render area */
-@media (max-width: 800px) {
-  #game-canvas {
-    min-height: 70vh !important;
-    height: 100vh !important;
-  }
 }
 
 /* Menu Styling */
@@ -198,6 +194,147 @@ body {
 
 .menu-button-danger:hover {
   background: linear-gradient(180deg, #ef5350 0%, #f44336 100%) !important;
+}
+
+/* Main menu density.
+   .menu-button declares font-size, padding and margin with !important, which
+   silently beat every inline size the menu tried to set — the buttons stayed at
+   their 20px/16px-padding default and the menu ran past the bottom of a laptop
+   screen. Declared here so the menu can size itself at all.
+
+   Sized in vh rather than fixed pixels: a tall desktop window gets big, easily
+   readable buttons, and a short one shrinks them instead of producing a
+   scrollbar. The clamps are tuned so the whole menu lands inside a ~900px
+   viewport at full size.
+
+   The explicit line-height matters more than it looks: the emoji in the labels
+   are drawn from a fallback font with a very tall line box, which was inflating
+   every button to ~86px regardless of its font size. Pinning it buys back the
+   room the labels needed to be legible in the first place. */
+#main-menu .menu-button {
+  font-size: clamp(16px, 2.6vh, 24px) !important;
+  line-height: 1.2 !important;
+  padding: clamp(10px, 1.7vh, 18px) clamp(20px, 2vw, 34px) !important;
+  margin: clamp(2px, 0.5vh, 6px) !important;
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
+/* The mode buttons were a fixed 320px wide. Once the labels grew, "Player vs
+   1 AI" no longer fit between the paddings and silently wrapped to a second
+   line, which is where an extra ~28px per button was going. The column sets one
+   width for all six instead, wide enough for the longest label. */
+#main-menu .mode-buttons {
+  width: min(390px, 88vw);
+}
+
+#main-menu .mode-buttons .menu-button {
+  width: 100% !important;
+}
+
+#main-menu button.menu-button-secondary {
+  font-size: clamp(12px, 1.6vh, 16px) !important;
+  line-height: 1.2 !important;
+  padding: clamp(8px, 1.2vh, 13px) clamp(12px, 1.2vw, 20px) !important;
+  margin: 0 !important;
+}
+
+/* Volume controls folded into the pause overlay. Scrolls on short screens so
+   the Quit button underneath is never pushed out of reach. */
+.pause-audio-panel {
+  width: min(440px, 90vw);
+  max-height: 46vh;
+  overflow-y: auto;
+  margin: 6px 0 4px;
+  padding: 20px 22px 2px;
+  background: rgba(0, 0, 0, 0.55);
+  border: 2px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  text-align: left;
+}
+
+/* Player name box on the main menu.
+   Deliberately shares the .powerup-toggle silhouette — same height, radius,
+   border weight and drop shadow — so the two sit together as one strip of
+   pre-match choices rather than looking like unrelated widgets. */
+.name-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 16px;
+  border-radius: 8px;
+  font-family: 'Russo One', sans-serif;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  background: linear-gradient(180deg, #2b3138 0%, #1b1f24 100%);
+  border: 2px solid #3a4149;
+  color: #cbd5e1;
+  box-shadow: 0 3px 0 #14171b, 0 4px 8px rgba(0, 0, 0, 0.3);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.name-box.is-saved {
+  border-color: #4ade80;
+  box-shadow: 0 3px 0 #14171b, 0 0 16px rgba(74, 222, 128, 0.45);
+}
+
+.name-box .nb-label {
+  white-space: nowrap;
+}
+
+.name-box .nb-input {
+  width: 110px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 2px solid #4b5563;
+  background: linear-gradient(180deg, #12131c 0%, #0b0c12 100%);
+  color: #ffffff;
+  font-family: 'Russo One', sans-serif;
+  font-size: 14px;
+  letter-spacing: 1px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.name-box .nb-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.45);
+}
+
+.name-box .nb-apply {
+  font-family: 'Press Start 2P', monospace;
+  font-size: 9px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #052e16;
+  background: linear-gradient(180deg, #4ade80 0%, #16a34a 100%);
+  border: 2px solid #86efac;
+  box-shadow: 0 2px 0 #14532d;
+  transition: transform 0.15s ease, filter 0.2s ease;
+}
+
+.name-box .nb-apply:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.1);
+}
+
+.name-box .nb-apply:active {
+  transform: translateY(1px);
+  box-shadow: 0 0 0 #14532d;
+}
+
+@media (max-width: 480px) {
+  .name-box {
+    font-size: 12px;
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .name-box .nb-input {
+    width: 92px;
+  }
 }
 
 /* Extended Power-Ups menu toggle.

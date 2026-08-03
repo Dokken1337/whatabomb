@@ -21,10 +21,11 @@ export function createTutorialScreen(onClose: () => void): HTMLDivElement {
   title.style.fontFamily = "'Press Start 2P', monospace"
   title.style.fontSize = '24px'
   title.style.marginBottom = '30px'
-  title.style.background = 'linear-gradient(180deg, #a78bfa 0%, #8b5cf6 100%)'
-  title.style.webkitBackgroundClip = 'text'
-  title.style.webkitTextFillColor = 'transparent'
-  title.style.filter = 'drop-shadow(0 4px 8px rgba(139, 92, 246, 0.4))'
+  // Was a violet gradient clipped to the text, which sat only a shade or two
+  // above this screen's dark blue background and read as barely-there. Warm
+  // amber with a dark outline is legible against it.
+  title.style.color = '#fbbf24'
+  title.style.textShadow = '0 0 14px rgba(251, 191, 36, 0.55), 3px 3px 0 #000'
   title.style.textAlign = 'center'
   tutorialDiv.appendChild(title)
 
