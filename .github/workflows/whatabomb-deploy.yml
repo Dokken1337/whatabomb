@@ -1,0 +1,221 @@
+# Deploy What'a Bomb Game
+name: whatabomb
+run-name: Deploy ${{ github.workflow }} to ${{ github.ref_name }} by @${{ github.actor }}
+on:
+  push:
+    branches:
+      - main
+#      - develop**
+    paths:
+      - .github/workflows/whatabomb-deploy.yml
+      - azure/bicep/web-app/**
+      - game/**
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'
+        required: false
+        default: 'warning'
+        type: choice
+        options:
+        - info
+        - warning
+        - debug
+      environment:
+        description: 'Environment to run tests against'
+        required: false
+        default: main
+        type: choice
+        options:
+        - main
+        - develop
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+    environment: 'prod'
+    location: 'swedencentral'
+    subscriptionId: ${{ vars.AZURE_SUBSCRIPTION_ID }} 
+    ########
+    # MISC #
+    ########
+    releaseVersion: ${{ github.run_number }}
+    tagVersion: ${{ github.run_number }}
+    tags: '"{
+      \"Responsible\": \"FredrikD\",
+      \"MadeBy\": \"${{ github.actor }}\",
+      \"Environment\": \"prod\",
+      \"Version\": \"${{ github.run_number }}\",
+      \"iac\": \"bicep\"    
+      }"'
+
+jobs:
+  ########################################
+  #     Runner & Environment Branch      #
+  ########################################
+  runner-environment:
+    runs-on: ubuntu-latest
+
+    steps:
+    - id: runner
+      run: echo "runner=ubuntu-latest" >> $GITHUB_OUTPUT #Choose between ubuntu-latest or self-hosted
+#      run: echo "runner=self-hosted" >> $GITHUB_OUTPUT #Choose between ubuntu-latest or self-hosted
+
+    - name: Select environment for branch
+      id: selectenvironment
+      shell: bash
+      run: |
+        branch="${{ github.ref_name }}"
+        if [ "$branch" != "main" ]; then
+          branch="develop"
+        fi
+        echo "environment=$branch" >> $GITHUB_OUTPUT
+
+    outputs:
+      runner: ${{ steps.runner.outputs.runner }}
+      currentEnvironment: ${{ steps.selectenvironment.outputs.environment }} 
+
+  ####################################
+  #      What'a Bomb Deployment      #
+  ####################################
+  deploy-whatabomb:
+    runs-on: ${{ needs.runner-environment.outputs.runner }}
+    needs:
+      - runner-environment
+
+    environment:
+      name: ${{ needs.runner-environment.outputs.currentEnvironment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # step; log into azure
+      - name: az cli login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.subscriptionId }}
+
+      - name: Deploy App Service and Webapp
+        id: deployappservice
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          region: ${{ env.location }}
+          subscriptionId: ${{ env.subscriptionId }}
+          template: azure/bicep/web-app/main.bicep
+          parameters:
+            location=${{ env.location }}
+            tags=${{ env.tags }}
+          deploymentName: whatabomb-${{ env.releaseVersion }}
+
+    # Surfaced so the game job targets whatever the template actually named,
+    # instead of hardcoding the convention in two places.
+    outputs:
+      webAppName: ${{ steps.deployappservice.outputs.webAppNameOut }}
+      webAppUrl: ${{ steps.deployappservice.outputs.webAppUrl }}
+
+  ####################################
+  #        Game Build & Upload       #
+  ####################################
+  deploy-game:
+    runs-on: ${{ needs.runner-environment.outputs.runner }}
+    needs:
+      - runner-environment
+      - deploy-whatabomb
+
+    environment:
+      name: ${{ needs.runner-environment.outputs.currentEnvironment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: game/package-lock.json
+
+      - name: Install dependencies
+        working-directory: game
+        run: npm ci
+
+      # Type checks the client, bundles it with Vite, then compiles the server.
+      - name: Build client and server
+        working-directory: game
+        run: npm run build
+
+      - name: Test lobby server
+        working-directory: game
+        run: npm run test:server
+
+      # The app runs with SCM_DO_BUILD_DURING_DEPLOYMENT=false, so the package
+      # must be complete and self-contained: build output, manifests, and
+      # production node_modules only. No sources, no devDependencies.
+      - name: Stage runtime package
+        run: |
+          set -euo pipefail
+          rm -rf publish
+          mkdir -p publish
+          cp -r game/dist publish/dist
+          cp -r game/dist-server publish/dist-server
+          cp game/package.json game/package-lock.json publish/
+          cd publish
+          npm ci --omit=dev
+          echo "Package contents:"
+          ls -1
+          du -sh . node_modules
+
+      - name: az cli login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.subscriptionId }}
+
+      # arm-deploy only emits outputs when the template actually ran, so fall
+      # back to the naming convention rather than deploying to an empty name.
+      - name: Resolve target web app
+        id: target
+        shell: bash
+        run: |
+          name="${{ needs.deploy-whatabomb.outputs.webAppName }}"
+          url="${{ needs.deploy-whatabomb.outputs.webAppUrl }}"
+          if [ -z "$name" ]; then
+            name="app-dokken-whatabomb"
+            echo "::warning::No webAppNameOut from the infra job; falling back to $name"
+          fi
+          [ -n "$url" ] || url="https://${name}.azurewebsites.net"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "url=$url"  >> "$GITHUB_OUTPUT"
+
+      - name: Upload game to Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.target.outputs.name }}
+          package: publish
+
+      # A green deploy step only means the zip landed. Prove the app booted and
+      # is actually serving before calling the run successful.
+      - name: Verify deployment
+        shell: bash
+        run: |
+          url="${{ steps.target.outputs.url }}"
+          echo "Checking $url"
+          for attempt in $(seq 1 30); do
+            if curl -sf --max-time 15 "$url/healthz" | grep -q '"ok":true'; then
+              echo "Healthy after $attempt attempt(s)"
+              curl -sf --max-time 15 "$url/healthz"; echo
+              status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$url/")
+              echo "Index returned $status"
+              [ "$status" = "200" ] || exit 1
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::App did not become healthy at $url/healthz"
+          exit 1
