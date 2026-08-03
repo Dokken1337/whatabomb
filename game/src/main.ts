@@ -3389,8 +3389,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         }
       }
 
-      // Check if player is hit
-      if (x === playerGridX && y === playerGridY && !playerInvulnerable) {
+      // Check if player is hit (offline only). Online matches keep the local
+      // player-1 state parked at its spawn, so blasts landing on that corner
+      // were draining a player nobody controls — and once its lives hit zero
+      // gameOver froze the whole simulation tick.
+      if (!online && x === playerGridX && y === playerGridY && !playerInvulnerable) {
         // Shield absorbs the hit
         if (shieldCharges > 0) {
           shieldCharges--
@@ -5190,7 +5193,13 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     updateUI()
   }
 
-  /** Fireball/scorch visuals for blasts the host resolved. */
+  /**
+   * Replay the visuals for blasts the host resolved.
+   *
+   * Mirrors what explodeBomb draws locally — fireball, halo, ground scorch,
+   * fire particles and the trailing smoke — so a guest sees the same
+   * explosion the host does rather than a bare flash.
+   */
   function playRemoteBlast(tiles: Array<[number, number]>): void {
     screenShake(0.4, 250)
     if (soundManager) soundManager.playSFX('explosion')
@@ -5201,32 +5210,97 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     const meshes: any[] = []
 
     tiles.forEach(([x, y], idx) => {
+      const isCenter = idx === 0
+      const world = gridToWorld(x, y)
+
       const fireball = MeshBuilder.CreateSphere('exp-fire', {
-        diameter: TILE_SIZE * (idx === 0 ? 0.95 : 0.8), segments: 8,
+        diameter: TILE_SIZE * (isCenter ? 0.95 : 0.8), segments: 8,
       }, scene)
-      fireball.position = gridToWorld(x, y)
+      fireball.position = world.clone()
       fireball.material = sharedExplosionMat
       meshes.push(fireball)
 
-      if (maxEmitters > 0 && idx % stride === 0) createExplosionParticles(x, y)
+      const halo = MeshBuilder.CreateSphere('exp-halo', {
+        diameter: TILE_SIZE * (isCenter ? 1.2 : 1.0), segments: 6,
+      }, scene)
+      halo.position = world.clone()
+      halo.material = sharedHaloMat
+      meshes.push(halo)
+
+      const scorch = MeshBuilder.CreateDisc('exp-scorch', {
+        radius: TILE_SIZE * 0.4, tessellation: 12,
+      }, scene)
+      scorch.rotation.x = Math.PI / 2
+      scorch.position = world.clone()
+      scorch.position.y = 0.02
+      scorch.material = sharedScorchMat
+      meshes.push(scorch)
+
+      // Same emitter budget the host uses, so a big blast does not spawn a
+      // particle system per tile.
+      if (maxEmitters > 0 && (isCenter || idx % stride === 0)) {
+        createExplosionParticles(x, y)
+        setTimeout(() => {
+          if (!scene.isDisposed) createSmokeParticles(x, y)
+        }, 150)
+      }
+
+      const delay = isCenter ? 0 : idx * 0.8
 
       const scaleAnim = new Animation('scaleAnim', 'scaling', 60, Animation.ANIMATIONTYPE_VECTOR3)
       scaleAnim.setKeys([
-        { frame: 0, value: new Vector3(0.05, 0.05, 0.05) },
-        { frame: 3, value: new Vector3(1.4, 1.5, 1.4) },
-        { frame: 14, value: new Vector3(0.5, 0.3, 0.5) },
-        { frame: 20, value: new Vector3(0, 0, 0) },
+        { frame: delay + 0, value: new Vector3(0.05, 0.05, 0.05) },
+        { frame: delay + 3, value: new Vector3(1.4, 1.5, 1.4) },
+        { frame: delay + 7, value: new Vector3(1.1, 1.0, 1.1) },
+        { frame: delay + 14, value: new Vector3(0.5, 0.3, 0.5) },
+        { frame: delay + 20, value: new Vector3(0, 0, 0) },
       ])
       fireball.animations.push(scaleAnim)
-      scene.beginAnimation(fireball, 0, 24, false)
+
+      const fadeAnim = new Animation('fadeAnim', 'visibility', 60, Animation.ANIMATIONTYPE_FLOAT)
+      fadeAnim.setKeys([
+        { frame: delay + 0, value: 1 },
+        { frame: delay + 10, value: 0.9 },
+        { frame: delay + 20, value: 0 },
+      ])
+      fireball.animations.push(fadeAnim)
+      scene.beginAnimation(fireball, 0, delay + 24, false)
+
+      const haloScale = new Animation('haloScale', 'scaling', 60, Animation.ANIMATIONTYPE_VECTOR3)
+      haloScale.setKeys([
+        { frame: delay + 0, value: new Vector3(0.3, 0.3, 0.3) },
+        { frame: delay + 4, value: new Vector3(1.5, 1.5, 1.5) },
+        { frame: delay + 10, value: new Vector3(2.0, 0.5, 2.0) },
+      ])
+      halo.animations.push(haloScale)
+
+      const haloFade = new Animation('haloFade', 'visibility', 60, Animation.ANIMATIONTYPE_FLOAT)
+      haloFade.setKeys([
+        { frame: delay + 0, value: 0.5 },
+        { frame: delay + 4, value: 0.3 },
+        { frame: delay + 10, value: 0 },
+      ])
+      halo.animations.push(haloFade)
+      scene.beginAnimation(halo, 0, delay + 14, false)
+
+      const scorchFade = new Animation('scorchFade', 'visibility', 60, Animation.ANIMATIONTYPE_FLOAT)
+      scorchFade.setKeys([
+        { frame: 0, value: 0 },
+        { frame: 5, value: 0.7 },
+        { frame: 40, value: 0.3 },
+        { frame: 60, value: 0 },
+      ])
+      scorch.animations.push(scorchFade)
+      scene.beginAnimation(scorch, 0, 60, false)
     })
 
+    const maxDelay = (tiles.length - 1) * 0.8
+    const cleanupMs = Math.max(Math.ceil(((maxDelay + 24) / 60) * 1000), 1000) + 100
     setTimeout(() => {
       if (scene.isDisposed) return
       meshes.forEach(m => { if (!m.isDisposed()) m.dispose() })
-    }, 600)
+    }, cleanupMs)
   }
-
   /** Round ends when at most one player is standing. Host reports the result. */
   function checkNetRoundOver(): void {
     if (!online || !online.isHost || roundReported) return
@@ -5309,9 +5383,15 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       const now = Date.now()
       const elapsed = now - lastTickAt
       lastTickAt = now
-      simulateOnlineTick()
-      if (online.isHost && !isPaused && !gameOver) {
-        updateBombs(Math.min(elapsed, 250))
+      // A throw here must not take the match down with it: an uncaught error
+      // inside the loop is exactly what silently froze clients before.
+      try {
+        simulateOnlineTick()
+        if (online.isHost && !isPaused && !gameOver) {
+          updateBombs(Math.min(elapsed, 250))
+        }
+      } catch (err) {
+        console.error('[net] simulation tick failed', err)
       }
     }, ONLINE_TICK_MS)
     scene.onDisposeObservable.add(() => clearInterval(tickTimer))
@@ -5332,6 +5412,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       get over() { return gameOver },
       get isCurrentScene() { return currentScene === scene },
       get engineIsCurrent() { return currentEngine === engine },
+      get net() { return online?.net ?? null },
     }
   }
 
@@ -5353,12 +5434,18 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // the local player-1/player-2 pair.
       if (online) {
         // Simulation runs on its own fixed-rate timer; the frame only draws.
-        renderOnlineVisuals(deltaTime)
-        if (isMobileDevice) {
-          const me = localNetPlayer()
-          if (me) followCamera(me.visualX, me.visualZ)
+        // Guarded because an exception escaping scene.render() permanently
+        // kills every later frame for this client.
+        try {
+          renderOnlineVisuals(deltaTime)
+          if (isMobileDevice) {
+            const me = localNetPlayer()
+            if (me) followCamera(me.visualX, me.visualZ)
+          }
+          updateOffscreenIndicators()
+        } catch (err) {
+          console.error('[net] render step failed', err)
         }
-        updateOffscreenIndicators()
         return
       }
 
