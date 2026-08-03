@@ -99,8 +99,8 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ env.subscriptionId }}
 
-      - name: Deploy App Service and Webapp
-        id: deployappservice
+      - name: Deploy What'aBomb Resources
+        id: deploywhabombres
         uses: azure/arm-deploy@v2
         with:
           scope: subscription
@@ -113,8 +113,8 @@ jobs:
     # Surfaced so the game job targets whatever the template actually named,
     # instead of hardcoding the convention in two places.
     outputs:
-      webAppName: ${{ steps.deployappservice.outputs.webAppNameOut }}
-      webAppUrl: ${{ steps.deployappservice.outputs.webAppUrl }}
+      webAppName: ${{ steps.deploywhabombres.outputs.webAppNameOut }}
+      webAppUrl: ${{ steps.deploywhabombres.outputs.webAppUrl }}
 
   ####################################
   #        Game Build & Upload       #
