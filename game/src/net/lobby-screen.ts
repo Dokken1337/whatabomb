@@ -13,6 +13,15 @@ export interface LobbyScreenOptions {
    * hangs off; until it launches a networked match the lobby just reports it.
    */
   onMatchStart?: (info: { seed: number; round: number; hostId: string; youAreHost: boolean }) => void
+  /**
+   * Fired when a round is decided. The caller tears the arena down and comes
+   * back here; `matchWinnerId` is set only when the whole match is over.
+   */
+  onRoundOver?: (info: {
+    winnerName: string | null
+    matchWinnerName: string | null
+    youWon: boolean
+  }) => void
 }
 
 /** Colour for a lobby slot, matching the in-game player colours. */
@@ -21,7 +30,7 @@ export function slotColor(slot: number): string {
 }
 
 export function createLobbyScreen(options: LobbyScreenOptions): HTMLDivElement {
-  const { net, getPlayerName, onBack, onMatchStart } = options
+  const { net, getPlayerName, onBack, onMatchStart, onRoundOver } = options
 
   const root = document.createElement('div')
   root.id = 'lobby-screen'
@@ -314,11 +323,24 @@ export function createLobbyScreen(options: LobbyScreenOptions): HTMLDivElement {
     },
     onRoundOver: msg => {
       render(msg.lobby)
-      if (msg.matchWinnerId) {
-        const winner = msg.lobby.players.find(p => p.id === msg.matchWinnerId)
-        blockedNote.textContent = winner ? `${winner.name} wins the match!` : 'Match over'
+      const roundWinner = msg.winnerId
+        ? msg.lobby.players.find(p => p.id === msg.winnerId)
+        : null
+      const matchWinner = msg.matchWinnerId
+        ? msg.lobby.players.find(p => p.id === msg.matchWinnerId)
+        : null
+
+      if (matchWinner) {
+        blockedNote.textContent = `${matchWinner.name} wins the match!`
         blockedNote.classList.add('is-good')
       }
+
+      // Lets the host tear the arena down and bring this screen back.
+      onRoundOver?.({
+        winnerName: roundWinner?.name ?? null,
+        matchWinnerName: matchWinner?.name ?? null,
+        youWon: msg.winnerId != null && msg.winnerId === net.youId,
+      })
     },
     onState: state => {
       if (state === 'closed') {

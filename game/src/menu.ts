@@ -4,6 +4,8 @@ export type GameMode = '1v1' | '1v2' | '1v3' | 'pvp' | 'time-attack' | 'survival
 
 export interface MenuOptions {
   onStartGame: (mode: GameMode) => void
+  /** Opens the online lobby. */
+  onPlayOnline: () => void
   /** Current state of the Extended Power-Ups setting. */
   getExtendedPowerUps: () => boolean
   /** Persist a new Extended Power-Ups state. */
@@ -46,6 +48,93 @@ export function showCountdown(onComplete: () => void, onTick?: () => void): void
   }
   
   updateCountdown()
+}
+
+/**
+ * Overlay asking whether a versus match is on one keyboard or over the network.
+ * Dismissable, so picking PvP by accident is not a dead end.
+ */
+function showVersusChoice(menuDiv: HTMLDivElement, options: MenuOptions): void {
+  const existing = document.getElementById('versus-choice')
+  if (existing) existing.remove()
+
+  const overlay = document.createElement('div')
+  overlay.id = 'versus-choice'
+  overlay.className = 'versus-choice-overlay'
+
+  const panel = document.createElement('div')
+  panel.className = 'versus-choice-panel'
+
+  const heading = document.createElement('h2')
+  heading.textContent = '👥 PLAYER VS PLAYER'
+  heading.className = 'versus-choice-title'
+  panel.appendChild(heading)
+
+  const choices: Array<{ label: string; hint: string; onPick: () => void }> = [
+    {
+      label: '🎮 Local',
+      hint: 'Two players, one keyboard — WASD and Arrow keys',
+      onPick: () => {
+        overlay.remove()
+        menuDiv.style.display = 'none'
+        options.onStartGame('pvp')
+      },
+    },
+    {
+      label: '🌐 Online',
+      hint: 'Up to 4 players, join with a 6-digit code',
+      onPick: () => {
+        overlay.remove()
+        menuDiv.style.display = 'none'
+        options.onPlayOnline()
+      },
+    },
+  ]
+
+  for (const choice of choices) {
+    const button = document.createElement('button')
+    button.className = 'menu-button versus-choice-button'
+
+    const label = document.createElement('span')
+    label.className = 'vc-label'
+    label.textContent = choice.label
+
+    const hint = document.createElement('span')
+    hint.className = 'vc-hint'
+    hint.textContent = choice.hint
+
+    button.append(label, hint)
+    button.addEventListener('click', choice.onPick)
+    panel.appendChild(button)
+  }
+
+  const cancel = document.createElement('button')
+  cancel.className = 'menu-button menu-button-danger versus-choice-cancel'
+  cancel.textContent = '← BACK'
+  cancel.addEventListener('click', () => overlay.remove())
+  panel.appendChild(cancel)
+
+  // Clicking the backdrop or pressing Escape also dismisses.
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.remove()
+  })
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation()
+      overlay.remove()
+    }
+  }
+  window.addEventListener('keydown', onKey, true)
+  const observer = new MutationObserver(() => {
+    if (!overlay.isConnected) {
+      window.removeEventListener('keydown', onKey, true)
+      observer.disconnect()
+    }
+  })
+  observer.observe(document.body, { childList: true })
+
+  overlay.appendChild(panel)
+  document.body.appendChild(overlay)
 }
 
 export function createMainMenu(options: MenuOptions): HTMLDivElement {
@@ -153,6 +242,12 @@ export function createMainMenu(options: MenuOptions): HTMLDivElement {
       button.style.boxShadow = '0 6px 0 #1B5E20, 0 8px 15px rgba(0,0,0,0.4)'
     })
     button.addEventListener('click', () => {
+      // Player vs Player is ambiguous: same keyboard, or over the network?
+      // Ask rather than guessing.
+      if (mode === 'pvp') {
+        showVersusChoice(menuDiv, options)
+        return
+      }
       menuDiv.style.display = 'none'
       options.onStartGame(mode)
     })

@@ -29,7 +29,7 @@ import { createMainMenu, createPauseMenu, showCountdown, type GameMode } from '.
 
 import { SoundManager } from './sound-manager'
 import { StatisticsManager } from './statistics'
-import { SettingsManager, sanitizePlayerName } from './settings'
+import { SettingsManager, sanitizePlayerName, PLAYER_COLORS } from './settings'
 import { createSettingsMenu } from './settings-menu'
 import { createStatsScreen } from './stats-screen'
 import { GameStateManager } from './game-state'
@@ -50,6 +50,7 @@ import {
 import { generateMap, type SpawnPoint } from './map-gen'
 import { NetClient } from './net/client'
 import { createLobbyScreen } from './net/lobby-screen'
+import type { WorldSnapshot } from '../shared/protocol'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -167,7 +168,52 @@ function setCharacterVisibility(root: TransformNode, value: number) {
   }
 }
 
-function createScene(engine: Engine, gameMode: GameMode): Scene {
+/** Everything the scene needs to run a networked match. */
+interface OnlineContext {
+  net: NetClient
+  seed: number
+  round: number
+  youId: string
+  isHost: boolean
+  roster: Array<{ id: string; name: string; slot: number }>
+  lives: number
+}
+
+/**
+ * One networked player. Online matches replace the hardcoded player-1 /
+ * player-2 pair with this list, so 2-4 humans share one code path.
+ */
+interface NetPlayer {
+  id: string
+  slot: number
+  name: string
+  isLocal: boolean
+  x: number
+  y: number
+  visualX: number
+  visualZ: number
+  mesh: any
+  lives: number
+  alive: boolean
+  maxBombs: number
+  currentBombs: number
+  blastRadius: number
+  hasKick: boolean
+  hasThrow: boolean
+  speed: number
+  moveDelay: number
+  lastMoveTime: number
+  lastDx: number
+  lastDy: number
+  invulnerable: boolean
+  invulnerableTimer: number
+  /** Latest input from this player, consumed by the host each frame. */
+  input: { dx: number; dy: number; bomb: boolean }
+  /** Highest input sequence seen, so out-of-order frames are dropped. */
+  inputSeq: number
+}
+
+function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext): Scene {
   const scene = new Scene(engine)
   
   // Update grid size from map config
@@ -228,7 +274,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
   // Best-of-N matches apply to the versus modes only. Survival and Time Attack
   // are single continuous runs.
-  const usesRounds = gameMode !== 'survival' && gameMode !== 'time-attack' && settings.rounds > 1
+  // Online matches are scored by the server, so the local round system stays
+  // out of the way — otherwise both would count the same round.
+  const usesRounds =
+    !online && gameMode !== 'survival' && gameMode !== 'time-attack' && settings.rounds > 1
   if (usesRounds && !gameStateManager.getRoundState()) {
     gameStateManager.initRounds(settings.rounds)
   } else if (!usesRounds) {
@@ -447,7 +496,11 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
   // Create map geometry
   const paddingBottom = isMobile() ? 4 : 0
-  const generated = generateMap(GRID_WIDTH, GRID_HEIGHT, currentMapConfig.theme, paddingBottom)
+  // Online matches pass the server's seed so every client builds the identical
+  // arena; offline play stays random.
+  const generated = generateMap(
+    GRID_WIDTH, GRID_HEIGHT, currentMapConfig.theme, paddingBottom, online?.seed,
+  )
   const grid = generated.grid
 
   // Note: We do NOT update global GRID_HEIGHT here so game logic (spawns/borders)
@@ -1814,9 +1867,11 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   let playerVisualZ = playerPos.z
   const MOVE_LERP_SPEED = 15 // Higher = faster interpolation
 
-  // Determine number of enemies based on game mode
-  const numEnemies = gameMode === '1v1' ? 1 : 
-                     gameMode === '1v2' ? 2 : 
+  // Determine number of enemies based on game mode.
+  // Online matches are humans only — no AI is spawned.
+  const numEnemies = online ? 0 :
+                     gameMode === '1v1' ? 1 :
+                     gameMode === '1v2' ? 2 :
                      gameMode === '1v3' ? 3 :
                      gameMode === 'time-attack' ? 3 :
                      gameMode === 'survival' ? 1 : 0
@@ -1887,6 +1942,66 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     }
   }
 
+  // ── Networked players ──────────────────────────────────────────────────────
+  // Spawn corners are the same ones the AI uses, indexed by lobby slot, so the
+  // four starting positions are the four carved-out corners of the arena.
+  const netPlayers: NetPlayer[] = []
+  if (online) {
+    const spawnForSlot = (slot: number): SpawnPoint =>
+      slot === 0 ? generated.playerSpawn : enemySpawns[(slot - 1) % enemySpawns.length]
+
+    for (const entry of online.roster) {
+      const spawn = spawnForSlot(entry.slot)
+      const isLocal = entry.id === online.youId
+      const colour = PLAYER_COLORS[entry.slot % PLAYER_COLORS.length].value
+      const mesh = createPlayerSprite(`net-${entry.slot}`, null, '🧑', colour)
+      ;(mesh as any)._cachedChildMeshes = mesh.getChildMeshes()
+      const world = gridToWorld(spawn.x, spawn.y)
+      mesh.position.x = world.x
+      mesh.position.y = TILE_SIZE * 0.5
+      mesh.position.z = world.z
+
+      netPlayers.push({
+        id: entry.id,
+        slot: entry.slot,
+        name: entry.name,
+        isLocal,
+        x: spawn.x,
+        y: spawn.y,
+        visualX: world.x,
+        visualZ: world.z,
+        mesh,
+        lives: online.lives,
+        alive: true,
+        maxBombs: 1,
+        currentBombs: 0,
+        blastRadius: 1,
+        hasKick: false,
+        hasThrow: false,
+        speed: 1,
+        moveDelay: 150,
+        lastMoveTime: 0,
+        lastDx: 0,
+        lastDy: 1,
+        invulnerable: false,
+        invulnerableTimer: 0,
+        input: { dx: 0, dy: 0, bomb: false },
+        inputSeq: -1,
+      })
+    }
+
+    // The offline player mesh is unused online; hide it rather than branching
+    // every place that touches it.
+    setCharacterVisibility(player, 0)
+  }
+
+  const localNetPlayer = (): NetPlayer | undefined => netPlayers.find(p => p.isLocal)
+  const netPlayerById = (id: string): NetPlayer | undefined => netPlayers.find(p => p.id === id)
+  /** Bomb ownerId encoding for a networked player; offline ids stay negative. */
+  const netOwnerId = (slot: number) => 1000 + slot
+  const netPlayerByOwnerId = (ownerId: number): NetPlayer | undefined =>
+    ownerId >= 1000 ? netPlayers.find(p => p.slot === ownerId - 1000) : undefined
+
   // Player 2 for PvP mode
   let player2GridX = enemySpawns[0].x
   let player2GridY = enemySpawns[0].y
@@ -1916,7 +2031,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   let player2VisualZ = 0
 
   let player2: any = null
-  if (gameMode === 'pvp') {
+  // Online matches carry gameMode 'pvp' but drive everything from netPlayers,
+  // so the local player-2 mesh must not be created — it would stand motionless
+  // on top of slot 1's spawn and be walked straight through.
+  if (gameMode === 'pvp' && !online) {
     player2 = createPlayerSprite('player2', null, '👤', settings.player2Color)
     ;(player2 as any)._cachedChildMeshes = player2.getChildMeshes()
     const player2Pos = gridToWorld(player2GridX, player2GridY)
@@ -2272,6 +2390,51 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       return html
     }
 
+    // Online matches have 2-4 humans and no AI, so the offline player-1 /
+    // player-2 panels do not describe the match at all. Render the roster.
+    if (online) {
+      const me = netPlayers.find(p => p.isLocal)
+      const startingLives = online.lives
+
+      if (me) {
+        const colour = PLAYER_COLORS[me.slot % PLAYER_COLORS.length].value
+        playerUIDiv.style.borderColor = `${colour}55`
+        playerUIDiv.innerHTML = `
+          <div style="font-size: 12px; margin-bottom: 8px; color: ${colour}; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px ${colour}88;">${escapeHtml(me.name)}</div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 18px;">${me.alive ? '❤️' : '💀'}</span>
+            <span style="font-size: 14px; font-weight: bold;">${me.lives}/${startingLives}</span>
+          </div>
+          ${healthBarHTML(me.lives, startingLives)}
+          ${powerupIconsHTML(me.maxBombs, me.blastRadius, me.hasKick, me.hasThrow, me.speed, 0, false, 0, 0, false)}
+        `
+      }
+
+      opponentUIDiv.style.borderColor = 'rgba(204, 68, 255, 0.3)'
+      let rosterHTML = `<div style="font-size: 12px; margin-bottom: 10px; color: #cc44ff; text-transform: uppercase; letter-spacing: 2px;">Players</div>`
+      for (const p of netPlayers) {
+        if (p.isLocal) continue
+        const colour = PLAYER_COLORS[p.slot % PLAYER_COLORS.length].value
+        const pct = Math.max(0, (p.lives / startingLives) * 100)
+        rosterHTML += `
+          <div style="margin-bottom: 8px; opacity: ${p.alive ? '1' : '0.45'};">
+            <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+              <span style="width: 10px; height: 10px; border-radius: 50%; background: ${colour};"></span>
+              <span style="font-size: 12px; color: #ddd;">${escapeHtml(p.name)}</span>
+              <span style="font-size: 11px; color: #888; margin-left: auto;">💣${p.maxBombs} ⚡${p.blastRadius}</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span style="font-size: 12px;">${p.alive ? '❤️' : '💀'} ${p.lives}</span>
+              <div style="flex: 1; height: 8px; background: #222; border-radius: 4px; overflow: hidden;">
+                <div style="width: ${pct}%; height: 100%; background: ${colour}; border-radius: 4px; transition: width 0.2s ease;"></div>
+              </div>
+            </div>
+          </div>`
+      }
+      opponentUIDiv.innerHTML = rosterHTML
+      return
+    }
+
     playerUIDiv.innerHTML = `
       <div style="font-size: 12px; margin-bottom: 8px; color: ${settings.player1Color}; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px ${settings.player1Color}88;">${escapeHtml(playerName)}</div>
       <div style="display: flex; align-items: center; gap: 8px;">
@@ -2281,7 +2444,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       ${healthBarHTML(playerLives, difficultyConfig.playerStartingLives)}
       ${powerupIconsHTML(maxBombs, blastRadius, hasKick, hasThrow, playerSpeed, shieldCharges, hasPierce, ghostTimer, powerBombCharges, hasLineBomb)}
     `
-    
+
     if (gameMode === 'pvp') {
       opponentUIDiv.style.borderColor = `${settings.player2Color}44`
       opponentUIDiv.innerHTML = `
@@ -3108,6 +3271,30 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       scorch.animations.push(scorchFade)
       scene.beginAnimation(scorch, 0, 60, false)
 
+      // Record what happened so the host can replay it on the guests.
+      if (online) {
+        pendingBlasts.push([x, y])
+        if (grid[y][x] === 'destructible') pendingCleared.push([x, y])
+      }
+
+      // Networked players take blast damage. Only the host resolves this; guests
+      // receive lives in the snapshot so the two can never disagree.
+      if (online && online.isHost) {
+        for (const np of netPlayers) {
+          if (!np.alive || np.invulnerable) continue
+          if (np.x !== x || np.y !== y) continue
+          np.lives--
+          np.invulnerable = true
+          np.invulnerableTimer = 2000
+          showHitIndicator(gridToWorld(np.x, np.y), scene, np.isLocal)
+          if (np.lives <= 0) {
+            np.alive = false
+            np.lives = 0
+          }
+          updateUI()
+        }
+      }
+
       // Destroy destructible blocks
       if (grid[y][x] === 'destructible') {
         grid[y][x] = 'empty'
@@ -3354,8 +3541,10 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         }
       })
 
-      // Check if player 2 is hit (PvP mode)
-      if (gameMode === 'pvp' && x === player2GridX && y === player2GridY && !player2Invulnerable) {
+      // Check if player 2 is hit (local PvP only). Online matches share the
+      // 'pvp' mode string but have no player-2 mesh, and its stale grid
+      // coordinates would let a blast "kill" a player that does not exist.
+      if (!online && gameMode === 'pvp' && x === player2GridX && y === player2GridY && !player2Invulnerable) {
         if (player2ShieldCharges > 0) {
           player2ShieldCharges--
           player2Invulnerable = true
@@ -3530,6 +3719,9 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
           currentBombs--
         } else if (bomb.ownerId === -2) {
           player2CurrentBombs--
+        } else if (bomb.ownerId !== undefined && bomb.ownerId >= 1000) {
+          const owner = netPlayerByOwnerId(bomb.ownerId)
+          if (owner) owner.currentBombs = Math.max(0, owner.currentBombs - 1)
         } else if (bomb.ownerId !== undefined && bomb.ownerId >= 0) {
           const owner = findEnemyById(bomb.ownerId)
           if (owner) owner.currentBombs = Math.max(0, owner.currentBombs - 1)
@@ -4151,6 +4343,8 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
 
   // Track which keys are currently held down for smooth movement
   const keysHeld: Set<string> = new Set()
+  /** Edge-triggered bomb request, consumed once per online tick. */
+  let netBombRequested = false
 
   // On-screen controls. Driven by the "On-Screen Controls" setting rather than
   // isMobile(), so desktop players can opt into the D-pad and bomb button and
@@ -4557,6 +4751,14 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
         // So we don't force move here. We just mark the start time.
     }
 
+    // Online: bomb is edge-triggered and resolved by the host.
+    if (online && (ev.key === ' ' || ev.key === 'Enter')) {
+      netBombRequested = true
+      const local = localNetPlayer()
+      if (local) local.input.bomb = true
+      return
+    }
+
     // Handle bomb placement (immediate, not held)
     if (ev.key === ' ') {
       const bombAtPlayer = bombs.find(b => b.x === playerGridX && b.y === playerGridY)
@@ -4631,7 +4833,22 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       }
     })
 
-    if (gameMode === 'pvp' && player2Lives > 0) {
+    // Online matches carry gameMode 'pvp' but have no local player 2 mesh —
+    // dereferencing it here threw inside the render loop, which silently killed
+    // every subsequent frame for the whole scene.
+    if (online) {
+      for (const np of netPlayers) {
+        if (np.isLocal || !np.alive) continue
+        gridToWorldInPlace(np.x, np.y, _tmpGridVec)
+        targets.push({
+          id: `net-${np.slot}`,
+          x: _tmpGridVec.x,
+          z: _tmpGridVec.z,
+          color: PLAYER_COLORS[np.slot % PLAYER_COLORS.length].value,
+          active: true,
+        })
+      }
+    } else if (gameMode === 'pvp' && player2 && player2Lives > 0) {
         // Add player 2
         targets.push({ id: 'p2', x: player2.position.x, z: player2.position.z, color: '#4488ff', active: true })
     }
@@ -4738,6 +4955,386 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     })
   }
 
+  // Route relayed traffic into this scene. The lobby screen keeps its own
+  // handlers for everything else, so these are installed on top and removed
+  // when the scene is disposed.
+  if (online) {
+    const previous = (online.net as any).handlers
+    online.net.setHandlers({
+      ...previous,
+      onRelayInput: msg => {
+        // Host only: fold a guest's input into their player slot.
+        const np = netPlayerById(msg.playerId)
+        if (!np || msg.seq <= np.inputSeq) return
+        np.inputSeq = msg.seq
+        np.input = { dx: msg.dx, dy: msg.dy, bomb: msg.bomb || np.input.bomb }
+      },
+      onRelayState: msg => {
+        // Guest only: adopt the host's world.
+        applySnapshot(msg.payload as WorldSnapshot)
+      },
+    })
+    scene.onDisposeObservable.add(() => {
+      online.net.setHandlers(previous ?? {})
+    })
+  }
+
+  /** Keep the camera on a target, clamped so it never shows outside the arena. */
+  function followCamera(targetX: number, targetZ: number): void {
+    const minX = -halfWorldWidth - margin + viewportHalfWidth
+    const maxX = halfWorldWidth + margin - viewportHalfWidth
+    const minZ = -halfWorldHeight - margin + viewportHalfHeight
+    const maxZ = halfWorldHeight + margin - viewportHalfHeight
+
+    // When the viewport is wider than the world there is nothing to pan to.
+    const clampedX = minX > maxX ? 0 : Math.max(minX, Math.min(maxX, targetX))
+    const clampedZ = minZ > maxZ ? 0 : Math.max(minZ, Math.min(maxZ, targetZ))
+
+    const lerpSpeed = 0.1
+    camera.target.x = camera.target.x + (clampedX - camera.target.x) * lerpSpeed
+    camera.target.z = camera.target.z + (clampedZ - camera.target.z) * lerpSpeed
+  }
+  // ── Online match plumbing ──────────────────────────────────────────────────
+  // Host-authoritative: the host simulates and ships snapshots, guests send
+  // inputs and render whatever comes back. Guests never simulate, so there is
+  // no second source of truth to drift from.
+
+  /** Blast and crate events accumulated since the last snapshot. */
+  const pendingBlasts: Array<[number, number]> = []
+  const pendingCleared: Array<[number, number]> = []
+
+  let localInputSeq = 0
+  let lastSentInput = ''
+  let lastSnapshotAt = 0
+  let roundReported = false
+  /** Bomb meshes a guest is showing, keyed by tile. */
+  const guestBombMeshes = new Map<string, any>()
+  const guestPowerUpMeshes = new Map<string, any>()
+
+  const SNAPSHOT_INTERVAL_MS = 66 // ~15Hz
+  const ONLINE_TICK_MS = 33 // ~30Hz simulation, independent of frame rate
+
+  /** Can this networked player step onto the tile? */
+  function netCanWalk(np: NetPlayer, tx: number, ty: number): boolean {
+    if (tx < 0 || ty < 0 || tx >= GRID_WIDTH || ty >= GRID_HEIGHT) return false
+    if (grid[ty][tx] !== 'empty') return false
+    if (bombs.some(b => b.x === tx && b.y === ty)) return false
+    return !netPlayers.some(other => other !== np && other.alive && other.x === tx && other.y === ty)
+  }
+
+  /** Apply one player's current input. Host only. */
+  function stepNetPlayer(np: NetPlayer, now: number): void {
+    if (!np.alive) return
+    const { dx, dy, bomb } = np.input
+
+    if (dx !== 0 || dy !== 0) {
+      np.lastDx = dx
+      np.lastDy = dy
+      faceDirection(np.mesh, dx, dy)
+      if (now - np.lastMoveTime >= np.moveDelay) {
+        const tx = np.x + dx
+        const ty = np.y + dy
+        if (netCanWalk(np, tx, ty)) {
+          np.x = tx
+          np.y = ty
+          np.lastMoveTime = now
+          collectNetPowerUps(np)
+        }
+      }
+    }
+
+    if (bomb && np.currentBombs < np.maxBombs && !bombs.some(b => b.x === np.x && b.y === np.y)) {
+      placeBomb(np.x, np.y, netOwnerId(np.slot), np.blastRadius)
+      np.currentBombs++
+      if ((np.mesh as any).triggerSquash) (np.mesh as any).triggerSquash()
+    }
+    // Bomb is edge-triggered: clear it so holding the key does not chain-place.
+    np.input.bomb = false
+  }
+
+  /** Power-up pickup for networked players. Host only. */
+  function collectNetPowerUps(np: NetPlayer): void {
+    for (let i = powerUps.length - 1; i >= 0; i--) {
+      const pu = powerUps[i]
+      if (pu.x !== np.x || pu.y !== np.y) continue
+
+      if (pu.type === 'extraBomb') np.maxBombs = Math.min(8, np.maxBombs + 1)
+      else if (pu.type === 'largerBlast') np.blastRadius = Math.min(8, np.blastRadius + 1)
+      else if (pu.type === 'kick') np.hasKick = true
+      else if (pu.type === 'throw') np.hasThrow = true
+      else if (pu.type === 'speed') {
+        np.speed++
+        np.moveDelay = Math.max(60, 150 - (np.speed - 1) * 30)
+      }
+
+      pu.mesh.dispose()
+      powerUps.splice(i, 1)
+      if (np.isLocal && soundManager) soundManager.playSFX('powerup')
+      updateUI()
+    }
+  }
+
+  /** Read local controls into the local player's input slot. */
+  function readLocalNetInput(): { dx: number; dy: number; bomb: boolean } {
+    let dx = 0
+    let dy = 0
+    if (keysHeld.has('w') || keysHeld.has('W') || keysHeld.has('ArrowUp')) dx = -1
+    else if (keysHeld.has('s') || keysHeld.has('S') || keysHeld.has('ArrowDown')) dx = 1
+    else if (keysHeld.has('a') || keysHeld.has('A') || keysHeld.has('ArrowLeft')) dy = -1
+    else if (keysHeld.has('d') || keysHeld.has('D') || keysHeld.has('ArrowRight')) dy = 1
+    const bomb = netBombRequested
+    netBombRequested = false
+    return { dx, dy, bomb }
+  }
+
+  function buildSnapshot(): WorldSnapshot {
+    const snapshot: WorldSnapshot = {
+      players: netPlayers.map(p => ({
+        id: p.id,
+        x: p.x,
+        y: p.y,
+        lives: p.lives,
+        alive: p.alive,
+        dx: p.lastDx,
+        dy: p.lastDy,
+        invulnerable: p.invulnerable,
+        bombs: p.maxBombs,
+        blast: p.blastRadius,
+      })),
+      bombs: bombs.map(b => ({ x: b.x, y: b.y, timer: b.timer, blast: b.blastRadius })),
+      powerUps: powerUps.map(p => ({ x: p.x, y: p.y, type: p.type })),
+      blasts: pendingBlasts.splice(0),
+      cleared: pendingCleared.splice(0),
+    }
+    return snapshot
+  }
+
+  /** Guests reconcile their world to the host's snapshot. */
+  function applySnapshot(snapshot: WorldSnapshot): void {
+    for (const sp of snapshot.players) {
+      const np = netPlayerById(sp.id)
+      if (!np) continue
+      // A drop in lives is the only signal a guest gets that someone was hit,
+      // so the feedback has to be raised here rather than in explodeBomb.
+      if (sp.lives < np.lives) {
+        showHitIndicator(gridToWorld(sp.x, sp.y), scene, np.isLocal)
+        if (np.isLocal) {
+          if (soundManager) soundManager.playSFX('death')
+          haptic([50, 30, 80])
+        }
+      }
+      np.x = sp.x
+      np.y = sp.y
+      np.lives = sp.lives
+      np.maxBombs = sp.bombs
+      np.blastRadius = sp.blast
+      np.invulnerable = sp.invulnerable
+      if (np.alive !== sp.alive) {
+        np.alive = sp.alive
+        setCharacterVisibility(np.mesh, sp.alive ? 1 : 0)
+      }
+      if (sp.dx !== 0 || sp.dy !== 0) faceDirection(np.mesh, sp.dx, sp.dy)
+    }
+
+    // Bombs: create meshes for new tiles, drop meshes for tiles that cleared.
+    const live = new Set<string>()
+    for (const sb of snapshot.bombs) {
+      const key = `${sb.x},${sb.y}`
+      live.add(key)
+      if (!guestBombMeshes.has(key)) {
+        const mesh = createBombMesh()
+        mesh.position = gridToWorld(sb.x, sb.y)
+        guestBombMeshes.set(key, mesh)
+      }
+    }
+    for (const [key, mesh] of [...guestBombMeshes]) {
+      if (live.has(key)) continue
+      mesh.getChildMeshes().forEach((c: any) => c.dispose())
+      mesh.dispose()
+      guestBombMeshes.delete(key)
+    }
+
+    // Replay the host's explosions and crate removals.
+    for (const [x, y] of snapshot.cleared) {
+      if (grid[y]?.[x] === 'destructible') {
+        grid[y][x] = 'empty'
+        if (removeCrateAt(x, y)) refreshShadows()
+      }
+    }
+    if (snapshot.blasts.length > 0) {
+      playRemoteBlast(snapshot.blasts)
+    }
+
+    // Power-ups.
+    const livePowerUps = new Set<string>()
+    for (const pu of snapshot.powerUps) {
+      const key = `${pu.x},${pu.y}`
+      livePowerUps.add(key)
+      if (!guestPowerUpMeshes.has(key)) {
+        const pos = gridToWorld(pu.x, pu.y)
+        const plane = MeshBuilder.CreatePlane('powerup-emoji', { size: TILE_SIZE * 0.8 }, scene)
+        plane.position.x = pos.x
+        plane.position.y = TILE_SIZE * 0.5
+        plane.position.z = pos.z
+        plane.billboardMode = 7
+        plane.material = getPowerUpMaterial(pu.type as PowerUpType)
+        guestPowerUpMeshes.set(key, plane)
+      }
+    }
+    for (const [key, mesh] of [...guestPowerUpMeshes]) {
+      if (livePowerUps.has(key)) continue
+      mesh.dispose()
+      guestPowerUpMeshes.delete(key)
+    }
+
+    updateUI()
+  }
+
+  /** Fireball/scorch visuals for blasts the host resolved. */
+  function playRemoteBlast(tiles: Array<[number, number]>): void {
+    screenShake(0.4, 250)
+    if (soundManager) soundManager.playSFX('explosion')
+    haptic([50, 30, 80])
+
+    const maxEmitters = particlesOn ? (lowSpec ? 3 : 6) : 0
+    const stride = Math.max(1, Math.ceil(tiles.length / Math.max(1, maxEmitters)))
+    const meshes: any[] = []
+
+    tiles.forEach(([x, y], idx) => {
+      const fireball = MeshBuilder.CreateSphere('exp-fire', {
+        diameter: TILE_SIZE * (idx === 0 ? 0.95 : 0.8), segments: 8,
+      }, scene)
+      fireball.position = gridToWorld(x, y)
+      fireball.material = sharedExplosionMat
+      meshes.push(fireball)
+
+      if (maxEmitters > 0 && idx % stride === 0) createExplosionParticles(x, y)
+
+      const scaleAnim = new Animation('scaleAnim', 'scaling', 60, Animation.ANIMATIONTYPE_VECTOR3)
+      scaleAnim.setKeys([
+        { frame: 0, value: new Vector3(0.05, 0.05, 0.05) },
+        { frame: 3, value: new Vector3(1.4, 1.5, 1.4) },
+        { frame: 14, value: new Vector3(0.5, 0.3, 0.5) },
+        { frame: 20, value: new Vector3(0, 0, 0) },
+      ])
+      fireball.animations.push(scaleAnim)
+      scene.beginAnimation(fireball, 0, 24, false)
+    })
+
+    setTimeout(() => {
+      if (scene.isDisposed) return
+      meshes.forEach(m => { if (!m.isDisposed()) m.dispose() })
+    }, 600)
+  }
+
+  /** Round ends when at most one player is standing. Host reports the result. */
+  function checkNetRoundOver(): void {
+    if (!online || !online.isHost || roundReported) return
+    const alive = netPlayers.filter(p => p.alive)
+    if (alive.length > 1) return
+    roundReported = true
+    online.net.send({ t: 'roundResult', winnerId: alive.length === 1 ? alive[0].id : null })
+  }
+
+  /**
+   * One fixed-rate simulation step.
+   *
+   * Deliberately NOT driven by requestAnimationFrame. Browsers suspend rAF in
+   * unfocused tabs, and because the host owns the simulation that would freeze
+   * the match for everyone the moment the host alt-tabbed. A timer keeps
+   * ticking (throttled, but alive) and recovers immediately on refocus.
+   */
+  function simulateOnlineTick(): void {
+    if (!online || isPaused || gameOver) return
+    const now = Date.now()
+    const stepMs = ONLINE_TICK_MS
+
+    const local = localNetPlayer()
+    const input = readLocalNetInput()
+    if (local) local.input = { ...input, bomb: input.bomb || local.input.bomb }
+
+    if (online.isHost) {
+      for (const np of netPlayers) stepNetPlayer(np, now)
+
+      // Invulnerability flicker is the host's call, mirrored via the snapshot.
+      for (const np of netPlayers) {
+        if (!np.invulnerable) continue
+        np.invulnerableTimer -= stepMs
+        if (np.invulnerableTimer <= 0) {
+          np.invulnerable = false
+          setCharacterVisibility(np.mesh, np.alive ? 1 : 0)
+        }
+      }
+
+      checkNetRoundOver()
+
+      if (now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS) {
+        lastSnapshotAt = now
+        online.net.send({ t: 'state', tick: now, payload: buildSnapshot() })
+      }
+    } else {
+      // Guests only publish input, and only when it actually changes, so a
+      // still player costs nothing.
+      const signature = `${input.dx},${input.dy},${input.bomb}`
+      if (signature !== lastSentInput || input.bomb) {
+        lastSentInput = signature
+        online.net.send({
+          t: 'input',
+          seq: ++localInputSeq,
+          dx: input.dx,
+          dy: input.dy,
+          bomb: input.bomb,
+        })
+      }
+    }
+  }
+
+  /** Visual-only: smooth meshes toward their authoritative grid position. */
+  function renderOnlineVisuals(deltaTime: number): void {
+    const lerp = Math.min(1, MOVE_LERP_SPEED * deltaTime / 1000)
+    for (const np of netPlayers) {
+      gridToWorldInPlace(np.x, np.y, _tmpGridVec)
+      np.visualX += (_tmpGridVec.x - np.visualX) * lerp
+      np.visualZ += (_tmpGridVec.z - np.visualZ) * lerp
+      np.mesh.position.x = np.visualX
+      np.mesh.position.z = np.visualZ
+    }
+  }
+
+  if (online) {
+    // Bombs tick here too, for the same reason: their fuses must not depend on
+    // whether the host is looking at the tab.
+    let lastTickAt = Date.now()
+    const tickTimer = setInterval(() => {
+      const now = Date.now()
+      const elapsed = now - lastTickAt
+      lastTickAt = now
+      simulateOnlineTick()
+      if (online.isHost && !isPaused && !gameOver) {
+        updateBombs(Math.min(elapsed, 250))
+      }
+    }, ONLINE_TICK_MS)
+    scene.onDisposeObservable.add(() => clearInterval(tickTimer))
+  }
+
+  // Dev-only handle for inspecting a live match from the console. Vite strips
+  // this branch from production builds.
+  if (import.meta.env.DEV) {
+    ;(window as any).__game = {
+      get scene() { return scene },
+      get netPlayers() { return netPlayers },
+      get bombs() { return bombs },
+      get powerUps() { return powerUps },
+      get online() { return online ? { isHost: online.isHost, youId: online.youId, seed: online.seed } : null },
+      get grid() { return grid },
+      get keysHeld() { return [...keysHeld] },
+      get paused() { return isPaused },
+      get over() { return gameOver },
+      get isCurrentScene() { return currentScene === scene },
+      get engineIsCurrent() { return currentEngine === engine },
+    }
+  }
+
   // Game loop update
   let lastTime = Date.now()
   let lastUIUpdateTime = 0
@@ -4752,6 +5349,19 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
     flushUI()
 
     if (!isPaused) {
+      // Online matches drive movement from the networked player list instead of
+      // the local player-1/player-2 pair.
+      if (online) {
+        // Simulation runs on its own fixed-rate timer; the frame only draws.
+        renderOnlineVisuals(deltaTime)
+        if (isMobileDevice) {
+          const me = localNetPlayer()
+          if (me) followCamera(me.visualX, me.visualZ)
+        }
+        updateOffscreenIndicators()
+        return
+      }
+
       // Process held keys for smooth continuous movement
       processHeldKeys()
       
@@ -4784,36 +5394,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
       })
       
       // Camera follow logic for mobile (cached — isMobile() reads window.innerWidth)
-      if (isMobileDevice) {
-        const targetX = player.position.x
-        const targetZ = player.position.z
-
-        const minX = -halfWorldWidth - margin + viewportHalfWidth
-        const maxX = halfWorldWidth + margin - viewportHalfWidth
-        const minZ = -halfWorldHeight - margin + viewportHalfHeight
-        const maxZ = halfWorldHeight + margin - viewportHalfHeight
-        
-        // Handle case where viewport is larger than world (center camera)
-        let clampedX = 0
-        let clampedZ = 0
-        
-        if (minX > maxX) {
-            clampedX = 0
-        } else {
-            clampedX = Math.max(minX, Math.min(maxX, targetX))
-        }
-        
-        if (minZ > maxZ) {
-            clampedZ = 0
-        } else {
-            clampedZ = Math.max(minZ, Math.min(maxZ, targetZ))
-        }
-        
-        // Smoothly interpolate camera target
-        const lerpSpeed = 0.1
-        camera.target.x = camera.target.x + (clampedX - camera.target.x) * lerpSpeed
-        camera.target.z = camera.target.z + (clampedZ - camera.target.z) * lerpSpeed
-      }
+      if (isMobileDevice) followCamera(player.position.x, player.position.z)
       
       // Call indicator update
       updateOffscreenIndicators()
@@ -4847,7 +5428,7 @@ function createScene(engine: Engine, gameMode: GameMode): Scene {
   return scene
 }
 
-function startGame(mode: GameMode) {
+function startGame(mode: GameMode, online?: OnlineContext) {
   // Clean up previous game
   if (currentScene) {
     currentScene.dispose()
@@ -4870,7 +5451,7 @@ function startGame(mode: GameMode) {
   const dpr = window.devicePixelRatio || 1
   if (onPhone && dpr > 2) currentEngine.setHardwareScalingLevel(dpr / 2)
 
-  currentScene = createScene(currentEngine, mode)
+  currentScene = createScene(currentEngine, mode, online)
   
   // IMMEDIATELY UNLOCK AUDIO on user interaction
   if (soundManager) {
@@ -4991,6 +5572,10 @@ const mainMenu = createMainMenu({
   onStartGame: (mode) => {
     startGame(mode)
   },
+  onPlayOnline: () => {
+    mainMenu.style.display = 'none'
+    lobbyScreen.style.display = 'flex'
+  },
   getExtendedPowerUps: () => settingsManager.getSettings().extendedPowerUps,
   onToggleExtendedPowerUps: (enabled) => settingsManager.setExtendedPowerUps(enabled),
 })
@@ -5038,17 +5623,99 @@ const lobbyScreen = createLobbyScreen({
     lobbyScreen.style.display = 'none'
     mainMenu.style.display = 'flex'
   },
-  // Integration point for networked play. The lobby handshake is complete —
-  // every client gets the same seed here, which generateMap()'s seed parameter
-  // turns into an identical arena. What is still missing is the in-match layer:
-  // spawning the other lobby players in the scene, relaying inputs to the host,
-  // and applying the host's snapshots on the guests.
   onMatchStart: info => {
-    console.log(
-      `[net] round ${info.round} starting, seed ${info.seed}, host=${info.youAreHost}`,
-    )
+    const lobby = netClient.lobby
+    if (!lobby || !netClient.youId) return
+
+    lobbyScreen.style.display = 'none'
+    startGame('pvp', {
+      net: netClient,
+      seed: info.seed,
+      round: info.round,
+      youId: netClient.youId,
+      isHost: info.youAreHost,
+      lives: lobby.config.lives,
+      roster: lobby.players
+        .filter(p => p.connected)
+        .map(p => ({ id: p.id, name: p.name, slot: p.slot })),
+    })
+  },
+  // The arena has no idea the round ended — the server decides that. Tear the
+  // scene down, show the result, and hand control back to the lobby so the
+  // next round can be readied up.
+  onRoundOver: info => {
+    teardownOnlineMatch()
+    showOnlineRoundResult(info)
   },
 })
+
+/** Dispose the running online arena and its DOM furniture. */
+function teardownOnlineMatch(): void {
+  if (currentScene) {
+    currentScene.dispose()
+    currentScene = null
+  }
+  if (currentEngine) {
+    currentEngine.dispose()
+    currentEngine = null
+  }
+  if (soundManager) soundManager.stopMusic()
+  document
+    .querySelectorAll(
+      '.game-ui-panel, .center-ui, .mobile-controls-container, .offscreen-indicator, .game-pause-btn, #indicator-container, #game-over-overlay',
+    )
+    .forEach(el => el.remove())
+  isPaused = false
+}
+
+/** Between-rounds banner, then back to the lobby. */
+function showOnlineRoundResult(info: {
+  winnerName: string | null
+  matchWinnerName: string | null
+  youWon: boolean
+}): void {
+  const overlay = document.createElement('div')
+  overlay.className = 'winner-overlay'
+  overlay.id = 'online-round-result'
+
+  const heading = document.createElement('div')
+  heading.className = `winner-text ${info.youWon ? 'victory' : 'defeat'}`
+  heading.style.fontSize = '34px'
+  heading.style.textAlign = 'center'
+
+  if (info.matchWinnerName) {
+    heading.textContent = info.youWon ? '🏆 YOU WIN THE MATCH!' : `🏆 ${info.matchWinnerName} WINS!`
+  } else if (info.winnerName) {
+    heading.textContent = info.youWon ? '✔️ ROUND WON!' : `${info.winnerName} takes the round`
+  } else {
+    heading.textContent = '🤝 DRAW'
+  }
+  overlay.appendChild(heading)
+
+  const hint = document.createElement('div')
+  hint.style.fontFamily = "'Russo One', sans-serif"
+  hint.style.fontSize = '15px'
+  hint.style.color = '#9ca3af'
+  hint.style.marginTop = '18px'
+  hint.textContent = info.matchWinnerName
+    ? 'Back to the lobby — ready up to play again'
+    : 'Back to the lobby — ready up for the next round'
+  overlay.appendChild(hint)
+
+  const button = document.createElement('button')
+  button.className = 'menu-button'
+  button.textContent = 'CONTINUE'
+  button.style.marginTop = '26px'
+  button.addEventListener('click', () => {
+    overlay.remove()
+    lobbyScreen.style.display = 'flex'
+  })
+  overlay.appendChild(button)
+
+  document.body.appendChild(overlay)
+
+  if (soundManager) soundManager.playSFX(info.youWon ? 'victory' : 'defeat')
+}
 document.body.appendChild(lobbyScreen)
 
 // Add global menu sound effects

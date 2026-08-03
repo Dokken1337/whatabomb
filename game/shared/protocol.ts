@@ -220,6 +220,49 @@ export type ServerMessage =
   | ErrorMessage
   | PongMessage
 
+// ── World snapshot ───────────────────────────────────────────────────────────
+// The host owns the simulation and ships one of these to guests each tick.
+// Guests are pure renderers: they never simulate, so the two sides cannot drift.
+
+export interface SnapshotPlayer {
+  id: string
+  /** Grid coordinates. Visual smoothing is the receiver's business. */
+  x: number
+  y: number
+  lives: number
+  alive: boolean
+  /** Facing, so remote characters animate the right way. */
+  dx: number
+  dy: number
+  invulnerable: boolean
+  bombs: number
+  blast: number
+}
+
+export interface SnapshotBomb {
+  x: number
+  y: number
+  /** Milliseconds left on the fuse, for the pulse animation. */
+  timer: number
+  blast: number
+}
+
+export interface SnapshotPowerUp {
+  x: number
+  y: number
+  type: string
+}
+
+export interface WorldSnapshot {
+  players: SnapshotPlayer[]
+  bombs: SnapshotBomb[]
+  powerUps: SnapshotPowerUp[]
+  /** Tiles that detonated since the last snapshot, replayed as visuals. */
+  blasts: Array<[number, number]>
+  /** Crates destroyed since the last snapshot. */
+  cleared: Array<[number, number]>
+}
+
 // ── Helpers shared by both sides ─────────────────────────────────────────────
 
 /** Wins needed to take a best-of-N match. */
