@@ -357,17 +357,10 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   // How much of the arena the camera shows. Below 1.0 the board is cropped and
   // the camera pans to follow the player.
   //
-  // Phones used to crop to 0.85 (0.70 on big maps) to make tiles bigger. That
-  // is what "zoomed in" meant: the board's left and right edges were simply off
-  // screen. Now that the framing below corrects for the viewport aspect there is
-  // vertical room to spare on a portrait phone, so cropping horizontally bought
-  // nothing — the whole arena fits at full width. Only genuinely large arenas
-  // still crop, because fitting a 21-wide board across a phone leaves tiles too
-  // small to aim at.
-  let zoomFactor = 1.0
-  if (isMobile() && maxDimension > 17) {
-    zoomFactor = 0.8
-  }
+  // Desktop shows the whole arena. Phones do their zooming in
+  // applyCameraFraming instead, which derives it from the actual screen shape
+  // rather than from a fixed guess — see the note there.
+  const zoomFactor = 1.0
   
   // Breathing room around the arena. Kept tight on desktop so the board claims
   // as much of the window height as it can — the square arena is height-bound
@@ -414,7 +407,19 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     const canvasAspect = renderWidth / renderHeight
     const contentAspect = (right - left) / (top - bottom)
 
-    if (canvasAspect > contentAspect) {
+    if (isMobile()) {
+      // Phones pin the *vertical* extent to the content — the arena plus the
+      // strip reserved for the controls — and let the width follow from the
+      // screen. That fills the display top to bottom with no empty bands, and
+      // on a portrait screen it zooms in exactly as far as removing that dead
+      // space requires, rather than by a fixed factor that was either too much
+      // or too little depending on the handset. The arena's sides fall outside
+      // the view and followCamera pans to keep the player on screen.
+      const centerX = (left + right) / 2
+      const halfWidth = ((top - bottom) * canvasAspect) / 2
+      left = centerX - halfWidth
+      right = centerX + halfWidth
+    } else if (canvasAspect > contentAspect) {
       // Extra horizontal room — grow sideways.
       const centerX = (left + right) / 2
       const halfWidth = ((top - bottom) * canvasAspect) / 2

@@ -239,6 +239,37 @@ body {
   margin: 0 !important;
 }
 
+/* Consistent hover feedback across the Settings screen.
+
+   A few controls had bespoke JS hover handlers and most had none, so the screen
+   felt half-interactive — the difficulty pills lit up, the volume and segmented
+   buttons did nothing. Expressed as brightness plus a lift rather than a
+   background change, so a control keeps whatever colour its own selected state
+   gives it; the transform needs !important because selected states set their
+   own transform inline. */
+#settings-menu button,
+.pause-audio-panel button {
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+#settings-menu button:not(.settings-swatch):hover,
+.pause-audio-panel button:hover {
+  filter: brightness(1.18);
+  transform: translateY(-2px) !important;
+}
+
+#settings-menu button:not(.settings-swatch):active,
+.pause-audio-panel button:active {
+  filter: brightness(1.05);
+  transform: translateY(1px) !important;
+}
+
+/* Swatches show selection by scaling, so they only brighten and glow. */
+#settings-menu .settings-swatch:hover {
+  filter: brightness(1.2);
+}
+
 /* Volume controls folded into the pause overlay. Scrolls on short screens so
    the Quit button underneath is never pushed out of reach. */
 .pause-audio-panel {

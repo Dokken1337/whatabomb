@@ -854,6 +854,9 @@ function createColorSetting(
 
   PLAYER_COLORS.forEach(colorOption => {
     const button = document.createElement('button')
+    // Classed so the shared hover rule can leave its transform alone — these
+    // use scale to show selection, not the lift the other controls use.
+    button.className = 'settings-swatch'
     button.style.width = '40px'
     button.style.height = '40px'
     button.style.borderRadius = '50%'

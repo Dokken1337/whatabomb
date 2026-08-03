@@ -28,6 +28,7 @@
   "//dependencies": "Runtime deps only. Babylon is bundled into dist/ by Vite at build time and is never required by the Node server, so it belongs in devDependencies — this keeps the deployed node_modules small.",
   "dependencies": {
     "express": "^5.1.0",
+    "redis": "^6.2.0",
     "ws": "^8.18.0"
   }
 }

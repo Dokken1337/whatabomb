@@ -13,9 +13,13 @@ import {
   isValidLobbyCode,
   type ClientMessage,
   type ErrorCode,
+  type LobbyStatus,
+  type LobbyView,
   type ServerMessage,
 } from '../shared/protocol.js'
-import { InMemoryLobbyStore, type LobbyStore } from './lobby-store.js'
+import { InMemoryLobbyStore, RedisLobbyStore, type LobbyStore } from './lobby-store.js'
+import { connectRedis, type RedisConnections } from './redis.js'
+import { createLocalRelay, createRedisRelay, type Relay, type RelayEnvelope } from './relay.js'
 import {
   IDLE_LOBBY_TTL_MS,
   RECONNECT_GRACE_MS,
@@ -41,7 +45,25 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const clientDir = path.resolve(here, '../../dist')
 
 const port = Number(process.env.PORT) || 8080
-const store: LobbyStore = new InMemoryLobbyStore()
+
+// Multi-instance support is opt-in via configuration. With REDIS_URL set,
+// lobbies are shared and messages cross instances; without it the server is a
+// single-process affair, which is all local development and the tests need.
+const redisUrl = process.env.REDIS_URL?.trim()
+
+let redis: RedisConnections | null = null
+let store: LobbyStore = new InMemoryLobbyStore()
+
+if (redisUrl) {
+  // Fail loudly rather than quietly degrading. A server that starts without the
+  // cache it was configured for looks healthy while every lobby code silently
+  // becomes invisible to the other instances — the exact bug this replaced.
+  redis = await connectRedis(redisUrl)
+  store = new RedisLobbyStore(redis.commands)
+  console.log('[whatabomb] lobby state shared via Redis')
+} else {
+  console.log('[whatabomb] no REDIS_URL — single-instance lobby state')
+}
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────
 
@@ -52,10 +74,11 @@ app.get('/healthz', async (_req, res) => {
     ok: true,
     protocol: PROTOCOL_VERSION,
     lobbies: await store.size(),
-    // Lobbies are per-process. Surfacing the instance makes a scale-out — where
-    // a code created on one worker is invisible on the other — diagnosable from
-    // outside instead of looking like a code that expired.
     instance: process.env.WEBSITE_INSTANCE_ID?.slice(0, 8) ?? 'local',
+    // Whether this instance is sharing lobby state. If this ever reports
+    // "local" in production, lobby codes have gone back to being per-instance
+    // and cross-instance joins will fail.
+    lobbyState: redis ? 'shared' : 'local',
   })
 })
 
@@ -103,6 +126,13 @@ const wss = new WebSocketServer({
   maxPayload: MAX_MESSAGE_BYTES,
 })
 
+// With Redis, every instance both publishes and receives; without it, delivery
+// is a direct call. Either way the rest of the server only ever addresses
+// players, never sockets on a particular machine.
+const relay: Relay = redis
+  ? await createRedisRelay(redis.commands, redis.subscriber, deliverLocally)
+  : createLocalRelay(deliverLocally)
+
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState !== WebSocket.OPEN) return
   socket.send(JSON.stringify(message))
@@ -112,17 +142,84 @@ function sendError(socket: WebSocket, code: ErrorCode, message: string): void {
   send(socket, { t: 'error', code, message })
 }
 
-/** Every open socket currently seated in `lobby`. */
-function connectionsFor(lobby: LobbyRecord): Connection[] {
-  const seated = new Set(lobby.players.map(p => p.id))
-  return [...connections.values()].filter(c => c.playerId && seated.has(c.playerId))
+/**
+ * Sockets this instance is holding for `code`, filtered to the addressed
+ * players. Other instances run the same function over their own sockets.
+ */
+function localConnectionsFor(code: string, playerIds: string[] | null): Connection[] {
+  const wanted = playerIds ? new Set(playerIds) : null
+  return [...connections.values()].filter(
+    c => c.lobbyCode === code && c.playerId && (!wanted || wanted.has(c.playerId)),
+  )
+}
+
+/**
+ * Who is in each lobby and who hosts it, cached per instance.
+ *
+ * Gameplay traffic — inputs and world snapshots — needs the host id and the
+ * roster on every single message. Reading those from Redis each time would put
+ * a network round trip in the movement path, so instead the cache is refreshed
+ * from the lobby views that already flow past on the relay. It is derived data
+ * only: anything that changes a lobby still writes to the store.
+ */
+interface MatchContext {
+  code: string
+  hostId: string
+  playerIds: string[]
+  status: LobbyStatus
+}
+
+const matchCache = new Map<string, MatchContext>()
+
+function rememberLobby(view: LobbyView): void {
+  const host = view.players.find(p => p.isHost)
+  if (!host) return
+  matchCache.set(view.code, {
+    code: view.code,
+    hostId: host.id,
+    playerIds: view.players.map(p => p.id),
+    status: view.status,
+  })
+}
+
+/** Cached roster for this connection's lobby, falling back to the store once. */
+async function matchContext(connection: Connection): Promise<MatchContext | null> {
+  if (!connection.lobbyCode) return null
+  const cached = matchCache.get(connection.lobbyCode)
+  if (cached) return cached
+
+  const lobby = await store.get(connection.lobbyCode)
+  if (!lobby) return null
+  const view = toView(lobby)
+  rememberLobby(view)
+  return matchCache.get(connection.lobbyCode) ?? null
+}
+
+/** Deliver a relayed envelope to whichever of its addressees are local. */
+function deliverLocally(envelope: RelayEnvelope): void {
+  // Every instance sees every envelope, so all of them keep an accurate roster
+  // even for lobbies they currently hold no sockets for.
+  const carried = (envelope.message as { lobby?: LobbyView }).lobby
+  if (carried) rememberLobby(carried)
+
+  for (const connection of localConnectionsFor(envelope.code, envelope.to)) {
+    send(connection.socket, envelope.message)
+  }
+}
+
+/**
+ * Send to players, wherever they are.
+ *
+ * Everything that has to reach someone other than the caller goes through here:
+ * a player's socket may well be pinned to a different instance, so addressing a
+ * local socket list directly would silently drop them.
+ */
+function relayTo(code: string, to: string[] | null, message: ServerMessage): void {
+  relay.publish({ code, to, message })
 }
 
 function broadcastLobby(lobby: LobbyRecord): void {
-  const view = toView(lobby)
-  for (const connection of connectionsFor(lobby)) {
-    send(connection.socket, { t: 'lobby', lobby: view })
-  }
+  relayTo(lobby.code, null, { t: 'lobby', lobby: toView(lobby) })
 }
 
 async function loadLobbyFor(connection: Connection): Promise<LobbyRecord | undefined> {
@@ -234,36 +331,48 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         sendError(socket, 'bad_request', 'Codes are 6 digits')
         return
       }
-      const lobby = await store.get(message.code)
-      if (!lobby) {
-        sendError(
-          socket,
-          'lobby_not_found',
-          'No lobby with that code — check the host is on this same site',
-        )
-        return
-      }
+      // Locked: two players joining through two different instances at the same
+      // moment would otherwise read the same roster and the second write would
+      // erase the first player's seat.
+      type JoinOutcome =
+        | { ok: false; code: ErrorCode; reason: string }
+        | { ok: true; lobby: LobbyRecord; playerId: string }
 
-      let player
-      try {
-        player = addPlayer(lobby, message.name)
-      } catch (err) {
-        if (err instanceof LobbyFullError) {
-          sendError(socket, 'lobby_full', err.message)
-        } else if (err instanceof LobbyInProgressError) {
-          sendError(socket, 'lobby_in_progress', err.message)
-        } else {
+      const outcome = await store.withLock(message.code, async (): Promise<JoinOutcome> => {
+        const lobby = await store.get(message.code)
+        if (!lobby) {
+          return {
+            ok: false,
+            code: 'lobby_not_found',
+            reason: 'No lobby with that code — check the host is on this same site',
+          }
+        }
+
+        try {
+          const player = addPlayer(lobby, message.name)
+          await store.set(lobby.code, lobby)
+          return { ok: true, lobby, playerId: player.id }
+        } catch (err) {
+          if (err instanceof LobbyFullError) {
+            return { ok: false, code: 'lobby_full', reason: err.message }
+          }
+          if (err instanceof LobbyInProgressError) {
+            return { ok: false, code: 'lobby_in_progress', reason: err.message }
+          }
           throw err
         }
+      })
+
+      if (!outcome.ok) {
+        sendError(socket, outcome.code, outcome.reason)
         return
       }
 
-      await store.set(lobby.code, lobby)
-      connection.lobbyCode = lobby.code
-      connection.playerId = player.id
+      connection.lobbyCode = outcome.lobby.code
+      connection.playerId = outcome.playerId
 
-      send(socket, { t: 'joined', youId: player.id, lobby: toView(lobby) })
-      broadcastLobby(lobby)
+      send(socket, { t: 'joined', youId: outcome.playerId, lobby: toView(outcome.lobby) })
+      broadcastLobby(outcome.lobby)
       return
     }
 
@@ -275,63 +384,88 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
     }
 
     case 'ready': {
-      const lobby = await loadLobbyFor(connection)
-      if (!lobby || !connection.playerId) {
+      if (!connection.lobbyCode || !connection.playerId) {
         sendError(socket, 'not_in_lobby', 'You are not in a lobby')
         return
       }
-      const player = findPlayer(lobby, connection.playerId)
-      if (!player) {
+      const playerId = connection.playerId
+      const ready = Boolean(message.ready)
+
+      const updated = await store.withLock(connection.lobbyCode, async () => {
+        const lobby = await loadLobbyFor(connection)
+        if (!lobby) return null
+        const player = findPlayer(lobby, playerId)
+        if (!player) return null
+        player.ready = ready
+        await store.set(lobby.code, lobby)
+        return lobby
+      })
+
+      if (!updated) {
         sendError(socket, 'not_in_lobby', 'You are not in a lobby')
         return
       }
-      player.ready = Boolean(message.ready)
-      await store.set(lobby.code, lobby)
-      broadcastLobby(lobby)
+      broadcastLobby(updated)
       return
     }
 
     case 'start': {
-      const lobby = await loadLobbyFor(connection)
-      if (!lobby || !connection.playerId) {
+      if (!connection.lobbyCode || !connection.playerId) {
         sendError(socket, 'not_in_lobby', 'You are not in a lobby')
         return
       }
-      if (lobby.hostId !== connection.playerId) {
-        sendError(socket, 'not_host', 'Only the host can start the match')
-        return
-      }
-      if (!canStart(lobby)) {
-        sendError(socket, 'cannot_start', startBlockedReason(lobby) ?? 'Cannot start yet')
-        return
-      }
-
-      beginRound(lobby)
-      await store.set(lobby.code, lobby)
-
+      const playerId = connection.playerId
       // One seed for everyone so all clients generate an identical arena.
       const seed = randomInt(0, 2 ** 31 - 1)
-      const view = toView(lobby)
-      for (const target of connectionsFor(lobby)) {
-        send(target.socket, {
-          t: 'matchStart',
-          seed,
-          round: lobby.round,
-          hostId: lobby.hostId,
-          lobby: view,
-        })
+
+      type StartOutcome =
+        | { ok: false; code: ErrorCode; reason: string }
+        | { ok: true; lobby: LobbyRecord }
+
+      const outcome = await store.withLock(connection.lobbyCode, async (): Promise<StartOutcome> => {
+        const lobby = await loadLobbyFor(connection)
+        if (!lobby) {
+          return { ok: false, code: 'not_in_lobby', reason: 'You are not in a lobby' }
+        }
+        if (lobby.hostId !== playerId) {
+          return { ok: false, code: 'not_host', reason: 'Only the host can start the match' }
+        }
+        if (!canStart(lobby)) {
+          return {
+            ok: false,
+            code: 'cannot_start',
+            reason: startBlockedReason(lobby) ?? 'Cannot start yet',
+          }
+        }
+        beginRound(lobby)
+        await store.set(lobby.code, lobby)
+        return { ok: true, lobby }
+      })
+
+      if (!outcome.ok) {
+        sendError(socket, outcome.code, outcome.reason)
+        return
       }
+
+      const { lobby } = outcome
+      relayTo(lobby.code, null, {
+        t: 'matchStart',
+        seed,
+        round: lobby.round,
+        hostId: lobby.hostId,
+        lobby: toView(lobby),
+      })
       return
     }
 
     case 'input': {
-      // Guests send inputs; only the host needs them.
-      const lobby = await loadLobbyFor(connection)
-      if (!lobby || !connection.playerId || lobby.status !== 'playing') return
+      // Guests send inputs; only the host needs them. Served from the cached
+      // roster rather than a store read — this runs at input rate, and a cache
+      // round trip per keypress would put Redis in the movement path.
+      const match = await matchContext(connection)
+      if (!match || !connection.playerId || match.status !== 'playing') return
 
-      const host = connectionsFor(lobby).find(c => c.playerId === lobby.hostId)
-      if (!host) return
-      send(host.socket, {
+      relayTo(match.code, [match.hostId], {
         t: 'relayInput',
         playerId: connection.playerId,
         seq: Number(message.seq) || 0,
@@ -343,46 +477,59 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
     }
 
     case 'state': {
-      // Only the host may describe the world.
-      const lobby = await loadLobbyFor(connection)
-      if (!lobby || lobby.hostId !== connection.playerId || lobby.status !== 'playing') return
+      // Only the host may describe the world. Cached for the same reason as
+      // input, more so: snapshots go out around fifteen times a second.
+      const match = await matchContext(connection)
+      if (!match || match.hostId !== connection.playerId || match.status !== 'playing') return
 
-      for (const target of connectionsFor(lobby)) {
-        if (target.playerId === lobby.hostId) continue
-        send(target.socket, {
-          t: 'relayState',
-          tick: Number(message.tick) || 0,
-          payload: message.payload,
-        })
-      }
+      const guests = match.playerIds.filter(id => id !== match.hostId)
+      if (guests.length === 0) return
+
+      relayTo(match.code, guests, {
+        t: 'relayState',
+        tick: Number(message.tick) || 0,
+        payload: message.payload,
+      })
       return
     }
 
     case 'roundResult': {
-      const lobby = await loadLobbyFor(connection)
-      if (!lobby || lobby.hostId !== connection.playerId) return
-      if (lobby.status !== 'playing') return
+      if (!connection.lobbyCode || !connection.playerId) return
+      const playerId = connection.playerId
+      const claimedWinner = message.winnerId
 
-      const winnerId =
-        typeof message.winnerId === 'string' && findPlayer(lobby, message.winnerId)
-          ? message.winnerId
-          : null
+      const outcome = await store.withLock(connection.lobbyCode, async () => {
+        const lobby = await loadLobbyFor(connection)
+        if (!lobby || lobby.hostId !== playerId) return null
+        if (lobby.status !== 'playing') return null
 
-      const { matchWinnerId } = recordRoundResult(lobby, winnerId)
-      await store.set(lobby.code, lobby)
+        const winnerId =
+          typeof claimedWinner === 'string' && findPlayer(lobby, claimedWinner)
+            ? claimedWinner
+            : null
 
-      const view = toView(lobby)
-      for (const target of connectionsFor(lobby)) {
-        send(target.socket, { t: 'roundOver', winnerId, lobby: view, matchWinnerId })
-      }
-
-      // A decided match rolls back to a fresh scoreboard so the group can
-      // immediately play again with the same code.
-      if (matchWinnerId) {
-        resetMatch(lobby)
+        const { matchWinnerId } = recordRoundResult(lobby, winnerId)
         await store.set(lobby.code, lobby)
-        broadcastLobby(lobby)
-      }
+        const view = toView(lobby)
+
+        // A decided match rolls back to a fresh scoreboard so the group can
+        // immediately play again with the same code.
+        if (matchWinnerId) {
+          resetMatch(lobby)
+          await store.set(lobby.code, lobby)
+        }
+        return { lobby, view, winnerId, matchWinnerId }
+      })
+
+      if (!outcome) return
+
+      relayTo(outcome.lobby.code, null, {
+        t: 'roundOver',
+        winnerId: outcome.winnerId,
+        lobby: outcome.view,
+        matchWinnerId: outcome.matchWinnerId,
+      })
+      if (outcome.matchWinnerId) broadcastLobby(outcome.lobby)
       return
     }
 
@@ -397,27 +544,36 @@ async function handleDisconnect(
   options: { immediate?: boolean } = {},
 ): Promise<void> {
   if (!connection.lobbyCode || !connection.playerId) return
-  const lobby = await store.get(connection.lobbyCode)
+  const code = connection.lobbyCode
+  const playerId = connection.playerId
+
+  const lobby = await store.withLock(code, async () => {
+    const current = await store.get(code)
+    if (!current) return null
+
+    const player = findPlayer(current, playerId)
+    if (!player) return null
+
+    if (options.immediate) {
+      removePlayer(current, playerId)
+    } else {
+      // Hold the seat briefly so a refresh or flaky connection does not end a match.
+      player.connected = false
+      player.ready = false
+      player.disconnectedAt = Date.now()
+    }
+
+    if (current.players.length === 0) {
+      await store.delete(code)
+      matchCache.delete(code)
+      return null
+    }
+
+    await store.set(code, current)
+    return current
+  })
+
   if (!lobby) return
-
-  const player = findPlayer(lobby, connection.playerId)
-  if (!player) return
-
-  if (options.immediate) {
-    removePlayer(lobby, connection.playerId)
-  } else {
-    // Hold the seat briefly so a refresh or flaky connection does not end a match.
-    player.connected = false
-    player.ready = false
-    player.disconnectedAt = Date.now()
-  }
-
-  if (lobby.players.length === 0) {
-    await store.delete(lobby.code)
-    return
-  }
-
-  await store.set(lobby.code, lobby)
   broadcastLobby(lobby)
 }
 
@@ -437,39 +593,54 @@ const heartbeat = setInterval(() => {
   }
 }, HEARTBEAT_INTERVAL_MS)
 
-// Reap abandoned lobbies and expired reconnect grace periods.
+/**
+ * Reap abandoned lobbies and expired reconnect grace periods.
+ *
+ * `connected` is only meaningful across the whole cluster, so this deliberately
+ * reads the shared record rather than local socket state — a player connected
+ * to another instance must not look absent from here.
+ */
 const sweep = setInterval(() => {
   void (async () => {
     const now = Date.now()
-    for (const lobby of await store.values()) {
-      let rosterChanged = false
+    for (const snapshot of await store.values()) {
+      // Re-read under the lock: a join landing on another instance between the
+      // scan and the write would otherwise be erased by this pass.
+      const result = await store.withLock(snapshot.code, async () => {
+        const lobby = await store.get(snapshot.code)
+        if (!lobby) return null
 
-      for (const player of [...lobby.players]) {
-        if (
-          !player.connected &&
-          player.disconnectedAt !== null &&
-          now - player.disconnectedAt > RECONNECT_GRACE_MS
-        ) {
-          removePlayer(lobby, player.id)
-          rosterChanged = true
+        let rosterChanged = false
+        for (const player of [...lobby.players]) {
+          if (
+            !player.connected &&
+            player.disconnectedAt !== null &&
+            now - player.disconnectedAt > RECONNECT_GRACE_MS
+          ) {
+            removePlayer(lobby, player.id)
+            rosterChanged = true
+          }
         }
-      }
 
-      // `updatedAt` only moves on a mutation, so a host sitting in an open
-      // lobby waiting for friends looks idle. Expiring on that alone deleted
-      // lobbies out from under people who were still connected and watching the
-      // code on screen — the joiner then got "no lobby with that code" for a
-      // code that was, from the host's side, plainly still there. A lobby is
-      // only ever reaped once nobody is connected to it.
-      const occupied = lobby.players.some(p => p.connected)
-      if (!occupied && (lobby.players.length === 0 || now - lobby.updatedAt > IDLE_LOBBY_TTL_MS)) {
-        await store.delete(lobby.code)
-        continue
-      }
-      if (occupied) lobby.updatedAt = now
+        // `updatedAt` only moves on a mutation, so a host sitting in an open
+        // lobby waiting for friends looks idle. Expiring on that alone deleted
+        // lobbies out from under people who were still connected and watching
+        // the code on screen — the joiner then got "no lobby with that code"
+        // for a code that was, from the host's side, plainly still there. A
+        // lobby is only ever reaped once nobody is connected to it.
+        const occupied = lobby.players.some(p => p.connected)
+        if (!occupied && (lobby.players.length === 0 || now - lobby.updatedAt > IDLE_LOBBY_TTL_MS)) {
+          await store.delete(lobby.code)
+          matchCache.delete(lobby.code)
+          return null
+        }
+        if (occupied) lobby.updatedAt = now
 
-      await store.set(lobby.code, lobby)
-      if (rosterChanged) broadcastLobby(lobby)
+        await store.set(lobby.code, lobby)
+        return { lobby, rosterChanged }
+      })
+
+      if (result?.rosterChanged) broadcastLobby(result.lobby)
     }
   })()
 }, 15_000)
@@ -481,6 +652,8 @@ server.listen(port, () => {
 
 function shutdown(signal: string): void {
   console.log(`[whatabomb] ${signal} received, shutting down`)
+  void relay.close()
+  void redis?.close()
   clearInterval(heartbeat)
   clearInterval(sweep)
   for (const connection of connections.values()) connection.socket.close(1001, 'Server shutting down')

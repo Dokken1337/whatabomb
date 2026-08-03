@@ -8,7 +8,7 @@ on:
 #      - develop**
     paths:
       - .github/workflows/whatabomb-deploy.yml
-      - azure/bicep/web-app/**
+      - azure/bicep/game-infrastructure/**
       - game/**
   workflow_dispatch:
     inputs:
@@ -106,8 +106,8 @@ jobs:
           scope: subscription
           region: ${{ env.location }}
           subscriptionId: ${{ env.subscriptionId }}
-          template: azure/bicep/web-app/main.bicep
-          additionalArguments: '--parameters azure/bicep/web-app/main.bicepparam'
+          template: azure/bicep/game-infrastructure/main.bicep
+          additionalArguments: '--parameters azure/bicep/game-infrastructure/main.bicepparam'
           deploymentName: whatabomb-${{ env.releaseVersion }}
 
     # Surfaced so the game job targets whatever the template actually named,
@@ -127,6 +127,21 @@ jobs:
 
     environment:
       name: ${{ needs.runner-environment.outputs.currentEnvironment }}
+
+    # The app runs on several instances, so the test suite runs two server
+    # processes against one cache to prove a lobby created on one is joinable
+    # from the other. Needs Docker on the runner; on a runner without it the
+    # multi-instance test skips rather than fails.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
@@ -149,6 +164,9 @@ jobs:
 
       - name: Test lobby server
         working-directory: game
+        env:
+          # Present, so the real two-instance test runs instead of skipping.
+          REDIS_URL: redis://127.0.0.1:6379
         run: npm run test:server
 
       # The app runs with SCM_DO_BUILD_DURING_DEPLOYMENT=false, so the package
