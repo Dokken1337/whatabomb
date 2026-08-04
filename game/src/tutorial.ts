@@ -88,7 +88,8 @@ export function createTutorialScreen(onClose: () => void): HTMLDivElement {
       color: '#4ade80',
       items: [
         '<strong>VS AI:</strong> Defeat 1-3 AI enemies',
-        '<strong>PvP:</strong> Local multiplayer battle',
+        '<strong>PvP — Local:</strong> Two players sharing one keyboard',
+        '<strong>🌐 PvP — Online:</strong> Up to 4 players. One player creates a lobby and shares the 6-digit code; everyone else joins with it',
         '<strong>🌊 Survival:</strong> Endless waves with increasing difficulty',
         '<strong>⏱️ Time Attack:</strong> Beat the clock (bonus time for kills)',
         'VS AI and PvP are played as a match — set the length in Settings (1 round, best of 3, or best of 5)',

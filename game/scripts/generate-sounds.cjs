@@ -327,15 +327,6 @@ function countdownTick() {
   }))
 }
 
-function walk() {
-  // Soft footstep
-  const dur = 0.12
-  return normalize(generate(dur, t => {
-    const env = decay(t, 20)
-    return (noise() * 0.5 + sin(200, t) * 0.2) * env
-  }))
-}
-
 // ─── Background Music Generator ─────────────────────────────────────────────
 
 function generateBGM() {
@@ -487,7 +478,6 @@ function main() {
     'kick': kick,
     'throw': throwSound,
     'countdown-tick': countdownTick,
-    'walk': walk,
     'bgm': generateBGM,
   }
 

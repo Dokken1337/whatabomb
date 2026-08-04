@@ -237,6 +237,23 @@ export interface SnapshotPlayer {
   invulnerable: boolean
   bombs: number
   blast: number
+  /** Extended power-up state, so guests render and score it the same way. */
+  kick: boolean
+  throwing: boolean
+  shield: number
+  pierce: boolean
+  /** Remaining ghost milliseconds; drives the see-through character. */
+  ghost: number
+  powerBomb: number
+  lineBomb: boolean
+  /**
+   * Highest input sequence the host has folded into this player.
+   *
+   * Guests predict their own movement locally; this tells them how much of
+   * what they sent the host has already accounted for, so a snapshot that
+   * predates their latest input does not yank them backwards.
+   */
+  ackSeq: number
 }
 
 export interface SnapshotBomb {

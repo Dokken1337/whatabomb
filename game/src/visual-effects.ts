@@ -9,9 +9,6 @@ export function setParticlesEnabled(enabled: boolean): void {
   particlesEnabled = enabled
 }
 
-export function areParticlesEnabled(): boolean {
-  return particlesEnabled
-}
 
 // One flare texture per scene, reused by every hit indicator. Creating a
 // Texture from the data URI on each hit meant a fresh GPU upload per explosion.

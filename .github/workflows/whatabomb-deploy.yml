@@ -225,7 +225,19 @@ jobs:
           for attempt in $(seq 1 30); do
             if curl -sf --max-time 15 "$url/healthz" | grep -q '"ok":true'; then
               echo "Healthy after $attempt attempt(s)"
-              curl -sf --max-time 15 "$url/healthz"; echo
+              health=$(curl -sf --max-time 15 "$url/healthz"); echo "$health"
+
+              # The plan runs several instances and lobbies live in Redis. A
+              # server that came up without REDIS_URL still reports ok:true, but
+              # holds lobbies per-process — so a code created on one instance is
+              # invisible on the others and joins fail with "no lobby with that
+              # code". That is the exact bug this stack exists to prevent, so
+              # fail the deploy here rather than let players discover it.
+              if ! echo "$health" | grep -q '"lobbyState":"shared"'; then
+                echo "::error::Server is up but lobby state is not shared - check REDIS_URL on the Web App"
+                exit 1
+              fi
+
               status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$url/")
               echo "Index returned $status"
               [ "$status" = "200" ] || exit 1

@@ -207,6 +207,19 @@ interface NetPlayer {
   lastDy: number
   invulnerable: boolean
   invulnerableTimer: number
+  // Extended power-ups. These used to exist only for the offline player, so
+  // online they could be picked up — the pickup even vanished — and then do
+  // nothing at all.
+  /** Hits absorbed before losing a life. */
+  shieldCharges: number
+  /** Blasts pass through crates. */
+  hasPierce: boolean
+  /** Remaining ms of walking through crates and bombs. */
+  ghostTimer: number
+  /** Bombs left that get +3 blast. */
+  powerBombCharges: number
+  /** Bomb key lays a row instead of one bomb. */
+  hasLineBomb: boolean
   /** Latest input from this player, consumed by the host each frame. */
   input: { dx: number; dy: number; bomb: boolean }
   /** Highest input sequence seen, so out-of-order frames are dropped. */
@@ -260,6 +273,22 @@ function applyAudioSettings(): void {
   soundManager.setUIVolume(settings.uiVolume)
   soundManager.setMuted(settings.muteAll)
 }
+
+/**
+ * Input sequence number for this browser, deliberately outside the scene.
+ *
+ * The host drops any input whose seq is not greater than the last it saw, and
+ * both sides rebuild their state for every round. When this counter lived on
+ * the scene it restarted at zero each round while the host could still be
+ * holding a high watermark from the previous one — inputs that arrived late,
+ * during the round-over grace period, set it. Every input for the rest of the
+ * match then failed the `seq <= inputSeq` check and was silently discarded, so
+ * a guest could neither move nor bomb from round two onwards.
+ *
+ * Never resetting it keeps every input strictly newer than anything the host
+ * can already have recorded.
+ */
+let localInputSeq = 0
 
 /**
  * The arena every online match is played on.
@@ -568,25 +597,33 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return createTexture('#8B4513', (ctx) => {
       const w = 128, h = 128
       if (theme === 'ice') {
-        // ICE: Frosted ice block
-        ctx.fillStyle = '#b8dff0'
+        // ICE: a deep, solid block of ice.
+        //
+        // This used to be near-white (#b8dff0) on a near-white floor, with the
+        // material at 85% alpha so the floor showed through as well — crates
+        // and open ground were all but the same colour. A breakable block has
+        // to read as an object first and as ice second, so this is much darker
+        // than the floor and framed by a hard rim.
+        ctx.fillStyle = '#2f6d99'
         ctx.fillRect(0, 0, w, h)
-        ctx.fillStyle = 'rgba(255,255,255,0.5)'
-        ctx.fillRect(8, 8, w - 16, h - 16)
-        // Crack lines
-        ctx.strokeStyle = 'rgba(180,220,240,0.8)'
-        ctx.lineWidth = 2
+        // Bevelled face, lighter towards the top left.
+        const iceFace = ctx.createLinearGradient(0, 0, w, h)
+        iceFace.addColorStop(0, '#6fb4dd')
+        iceFace.addColorStop(0.55, '#4a91c4')
+        iceFace.addColorStop(1, '#31719d')
+        ctx.fillStyle = iceFace
+        ctx.fillRect(9, 9, w - 18, h - 18)
+        // Bright fracture lines — high contrast against the darker body.
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+        ctx.lineWidth = 3
         ctx.beginPath()
-        ctx.moveTo(20, 30); ctx.lineTo(60, 50); ctx.lineTo(110, 35)
-        ctx.moveTo(30, 90); ctx.lineTo(70, 70); ctx.lineTo(100, 95)
+        ctx.moveTo(24, 34); ctx.lineTo(62, 54); ctx.lineTo(104, 38)
+        ctx.moveTo(32, 92); ctx.lineTo(72, 72); ctx.lineTo(100, 98)
         ctx.stroke()
-        // Frost sparkles
-        ctx.fillStyle = 'rgba(255,255,255,0.9)'
-        for (let i = 0; i < 8; i++) {
-          ctx.beginPath()
-          ctx.arc(15 + Math.random() * 98, 15 + Math.random() * 98, 2, 0, Math.PI * 2)
-          ctx.fill()
-        }
+        // Hard outer rim so the silhouette stays crisp against pale ground.
+        ctx.strokeStyle = '#14364f'
+        ctx.lineWidth = 6
+        ctx.strokeRect(3, 3, w - 6, h - 6)
       } else if (theme === 'lava') {
         // LAVA: Volcanic rock with glowing cracks
         ctx.fillStyle = '#2a1a1a'
@@ -611,29 +648,44 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           ctx.fill()
         }
       } else if (theme === 'forest') {
-        // FOREST: Log / bush texture
-        ctx.fillStyle = '#3a5a20'
+        // FOREST: a wooden crate, deliberately not foliage.
+        //
+        // This was previously a bush in greens (#3a5a20 / #4a7a28) sitting on a
+        // green forest floor, so there was nothing to tell you which tiles you
+        // could walk through. Warm timber against green ground separates by hue
+        // as well as by value, and it reads as breakable at a glance.
+        ctx.fillStyle = '#6b3f18'
         ctx.fillRect(0, 0, w, h)
-        // Leaf clusters
-        ctx.fillStyle = '#4a7a28'
-        for (let i = 0; i < 12; i++) {
-          ctx.beginPath()
-          ctx.arc(Math.random() * w, Math.random() * h, 10 + Math.random() * 12, 0, Math.PI * 2)
-          ctx.fill()
+        // Planks with darker seams between them.
+        for (let i = 0; i < 4; i++) {
+          const y = 8 + i * 29
+          const plank = ctx.createLinearGradient(0, y, 0, y + 25)
+          plank.addColorStop(0, '#a9702f')
+          plank.addColorStop(0.5, '#8d5a24')
+          plank.addColorStop(1, '#7a4c1d')
+          ctx.fillStyle = plank
+          ctx.fillRect(8, y, w - 16, 25)
         }
-        ctx.fillStyle = '#2a4a15'
-        for (let i = 0; i < 8; i++) {
+        // Diagonal brace, the classic "this is a crate" cue.
+        ctx.strokeStyle = 'rgba(60,34,12,0.55)'
+        ctx.lineWidth = 7
+        ctx.beginPath()
+        ctx.moveTo(12, h - 12); ctx.lineTo(w - 12, 12)
+        ctx.stroke()
+        // Grain flecks for a bit of life.
+        ctx.strokeStyle = 'rgba(45,26,10,0.35)'
+        ctx.lineWidth = 1
+        for (let i = 0; i < 14; i++) {
+          const gy = 10 + Math.random() * (h - 20)
           ctx.beginPath()
-          ctx.arc(Math.random() * w, Math.random() * h, 6 + Math.random() * 8, 0, Math.PI * 2)
-          ctx.fill()
+          ctx.moveTo(12 + Math.random() * 30, gy)
+          ctx.lineTo(60 + Math.random() * 50, gy)
+          ctx.stroke()
         }
-        // Highlights
-        ctx.fillStyle = 'rgba(120,200,60,0.3)'
-        for (let i = 0; i < 6; i++) {
-          ctx.beginPath()
-          ctx.arc(Math.random() * w, Math.random() * h, 4, 0, Math.PI * 2)
-          ctx.fill()
-        }
+        // Hard rim, same reasoning as the ice block.
+        ctx.strokeStyle = '#3d2109'
+        ctx.lineWidth = 6
+        ctx.strokeRect(3, 3, w - 6, h - 6)
       } else if (theme === 'space') {
         // SPACE: Supply crate with markings
         ctx.fillStyle = '#3a3a4a'
@@ -702,7 +754,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   crateMaterial.diffuseTexture = createDestructibleTexture(theme)
   crateMaterial.specularColor = new Color3(0.1, 0.1, 0.1)
   if (theme === 'ice') {
-    crateMaterial.alpha = 0.85
+    // Opaque. It used to be 85% alpha, which let the pale floor show through a
+    // block that was already almost the floor's colour. The specular highlight
+    // is what sells it as ice; transparency just cost readability.
     crateMaterial.specularColor = new Color3(0.6, 0.6, 0.6)
     crateMaterial.specularPower = 64
   }
@@ -2030,6 +2084,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         lastDy: 1,
         invulnerable: false,
         invulnerableTimer: 0,
+        shieldCharges: 0,
+        hasPierce: false,
+        ghostTimer: 0,
+        powerBombCharges: 0,
+        hasLineBomb: false,
         input: { dx: 0, dy: 0, bomb: false },
         inputSeq: -1,
       })
@@ -2960,9 +3019,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
     // Calculate blast radius (with Power Bomb bonus for player 1)
     let effectiveBlastRadius = ownerBlastRadius !== undefined ? ownerBlastRadius : blastRadius
-    if (ownerId === -1 && powerBombCharges > 0) {
+    // Networked owners spend their own charge; the offline player spends theirs.
+    const netOwner = netPlayerByOwnerId(ownerId)
+    const usesPowerBomb =
+      netOwner !== undefined ? netOwner.powerBombCharges > 0 : ownerId === -1 && powerBombCharges > 0
+    if (usesPowerBomb) {
       effectiveBlastRadius += 3
-      powerBombCharges--
+      if (netOwner) netOwner.powerBombCharges--
+      else powerBombCharges--
       // Visual: tint the bomb orange to indicate power bomb (clone to avoid mutating shared material)
       if (bombMesh.material) {
         const pbMat = (bombMesh.material as StandardMaterial).clone('power-bomb-mat')!
@@ -3188,7 +3252,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     haptic([50, 30, 80])
     
     // Check if bomb owner has pierce ability
-    const ownerHasPierce = bomb.ownerId === -1 ? hasPierce :
+    // Networked owners were never consulted here, so a guest holding Pierce got
+    // an ordinary blast that stopped at the first crate.
+    const netOwner = bomb.ownerId === undefined ? undefined : netPlayerByOwnerId(bomb.ownerId)
+    const ownerHasPierce = netOwner ? netOwner.hasPierce :
+                           bomb.ownerId === -1 ? hasPierce :
                            bomb.ownerId === -2 ? player2HasPierce : false
     
     const explosionTiles: Array<[number, number]> = [[bomb.x, bomb.y]]
@@ -3328,6 +3396,17 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         for (const np of netPlayers) {
           if (!np.alive || np.invulnerable) continue
           if (np.x !== x || np.y !== y) continue
+
+          // Shield soaks the hit instead of a life, as it does offline. Without
+          // this a networked shield was collected and then never consulted.
+          if (np.shieldCharges > 0) {
+            np.shieldCharges--
+            np.invulnerable = true
+            np.invulnerableTimer = 1000
+            updateUI()
+            continue
+          }
+
           np.lives--
           np.invulnerable = true
           np.invulnerableTimer = 2000
@@ -4237,23 +4316,35 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return kickBombFrom(player2GridX, player2GridY, dx, dy)
   }
 
-  // Throw bomb function
+  /** Offline player 1. Networked players go through throwBombFrom directly. */
   function throwBomb(dx: number, dy: number) {
     if (!hasThrow) return false
-    
-    // Check if there's a bomb at player position
-    const bombAtPlayer = bombs.find(b => b.x === playerGridX && b.y === playerGridY)
+    return throwBombFrom(playerGridX, playerGridY, dx, dy)
+  }
+
+  /**
+   * Throw the bomb standing on `(originX, originY)` up to three tiles along
+   * `(dx, dy)`, clearing obstacles in between.
+   *
+   * Takes an origin rather than reading player 1's globals so the host can run
+   * it for any networked player — throw was collectable online but had no code
+   * path that could ever fire it.
+   */
+  function throwBombFrom(originX: number, originY: number, dx: number, dy: number) {
+    if (dx === 0 && dy === 0) return false
+
+    const bombAtPlayer = bombs.find(b => b.x === originX && b.y === originY)
     if (!bombAtPlayer) return false
 
     // Throw distance is 3 tiles - bomb flies over obstacles and lands on the other side
     const throwDistance = 3
-    let finalX = playerGridX
-    let finalY = playerGridY
+    let finalX = originX
+    let finalY = originY
 
     // Check from farthest to nearest to find valid landing spot (skipping over obstacles)
     for (let i = throwDistance; i >= 1; i--) {
-      const checkX = playerGridX + dx * i
-      const checkY = playerGridY + dy * i
+      const checkX = originX + dx * i
+      const checkY = originY + dy * i
 
       // Skip if out of bounds
       if (checkX < 0 || checkY < 0 || checkX >= GRID_WIDTH || checkY >= GRID_HEIGHT) {
@@ -4277,7 +4368,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     }
 
     // Move the bomb to the new position
-    if (finalX !== playerGridX || finalY !== playerGridY) {
+    if (finalX !== originX || finalY !== originY) {
       bombAtPlayer.x = finalX
       bombAtPlayer.y = finalY
       
@@ -4500,6 +4591,24 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       actionBtn.classList.add('active')
 
       if (gameOver || isPaused) return
+
+      // Online: the host owns bomb placement, so this has to raise the same
+      // edge-triggered request the keyboard does rather than place one locally.
+      //
+      // The D-pad works online only because it drives `keysHeld`, which
+      // readLocalNetInput reads. This button bypassed that and called
+      // placeBomb() straight out, which online targets the parked player-1
+      // state — hidden at its spawn corner — so the bomb went nowhere and the
+      // host never heard about it. Touch players simply could not bomb.
+      if (online) {
+        netBombRequested = true
+        const local = localNetPlayer()
+        if (local) local.input.bomb = true
+        // The host's snapshot is a round trip away; buzz now so the button
+        // still feels like it responded.
+        haptic(30)
+        return
+      }
 
       const bombAtPlayer = bombs.find(b => b.x === playerGridX && b.y === playerGridY)
       if (bombAtPlayer && hasThrow) {
@@ -5064,10 +5173,17 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   const pendingBlasts: Array<[number, number]> = []
   const pendingCleared: Array<[number, number]> = []
 
-  let localInputSeq = 0
   let lastSentInput = ''
   let lastSnapshotAt = 0
   let roundReported = false
+  /**
+   * Sequence number of the newest input this guest has already acted on locally.
+   *
+   * Prediction and reconciliation hang off this: applySnapshot ignores the
+   * host's position for the local player until the host acknowledges at least
+   * this input, so a snapshot in flight cannot undo a move we have shown.
+   */
+  let lastPredictedSeq = -1
   /** Bomb meshes a guest is showing, keyed by tile. */
   const guestBombMeshes = new Map<string, any>()
   const guestPowerUpMeshes = new Map<string, any>()
@@ -5077,18 +5193,30 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /** How long the host lets the final explosion play before ending the round. */
   const ROUND_OVER_GRACE_MS = 1300
 
-  /** Can this networked player step onto the tile? */
+  /**
+   * Can this networked player step onto the tile?
+   *
+   * Ghost mode walks through crates and bombs, matching the offline rule.
+   */
   function netCanWalk(np: NetPlayer, tx: number, ty: number): boolean {
     if (tx < 0 || ty < 0 || tx >= GRID_WIDTH || ty >= GRID_HEIGHT) return false
-    if (grid[ty][tx] !== 'empty') return false
-    if (bombs.some(b => b.x === tx && b.y === ty)) return false
+    const ghosting = np.ghostTimer > 0
+    if (grid[ty][tx] === 'wall') return false
+    if (grid[ty][tx] === 'destructible' && !ghosting) return false
+    if (!ghosting && bombs.some(b => b.x === tx && b.y === ty)) return false
     return !netPlayers.some(other => other !== np && other.alive && other.x === tx && other.y === ty)
   }
 
   /** Apply one player's current input. Host only. */
-  function stepNetPlayer(np: NetPlayer, now: number): void {
+  function stepNetPlayer(np: NetPlayer, now: number, stepMs: number): void {
     if (!np.alive) return
     const { dx, dy, bomb } = np.input
+
+    // Ghost runs down on the host, which owns the clock for it.
+    if (np.ghostTimer > 0) {
+      np.ghostTimer = Math.max(0, np.ghostTimer - stepMs)
+      setCharacterVisibility(np.mesh, np.ghostTimer > 0 ? 0.5 : 1)
+    }
 
     if (dx !== 0 || dy !== 0) {
       np.lastDx = dx
@@ -5102,17 +5230,59 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           np.y = ty
           np.lastMoveTime = now
           collectNetPowerUps(np)
+        } else if (np.hasKick && bombs.some(b => b.x === tx && b.y === ty)) {
+          // Blocked by a bomb, and this player can kick — shove it along.
+          // kickBombFrom already works from an arbitrary tile; nothing was
+          // calling it for networked players, so kick was collectable online
+          // but inert.
+          kickBombFrom(np.x, np.y, dx, dy)
+          np.lastMoveTime = now
         }
       }
     }
 
-    if (bomb && np.currentBombs < np.maxBombs && !bombs.some(b => b.x === np.x && b.y === np.y)) {
-      placeBomb(np.x, np.y, netOwnerId(np.slot), np.blastRadius)
-      np.currentBombs++
-      if ((np.mesh as any).triggerSquash) (np.mesh as any).triggerSquash()
+    if (bomb) {
+      const bombUnderfoot = bombs.find(b => b.x === np.x && b.y === np.y)
+      if (bombUnderfoot && np.hasThrow) {
+        // Standing on your own bomb with throw: hurl it, exactly as the
+        // offline bomb key does.
+        throwBombFrom(np.x, np.y, np.lastDx, np.lastDy)
+      } else if (!bombUnderfoot && np.currentBombs < np.maxBombs) {
+        if (np.hasLineBomb) {
+          np.currentBombs += placeNetLineBomb(np)
+        } else {
+          placeBomb(np.x, np.y, netOwnerId(np.slot), np.blastRadius)
+          np.currentBombs++
+        }
+        if ((np.mesh as any).triggerSquash) (np.mesh as any).triggerSquash()
+      }
     }
     // Bomb is edge-triggered: clear it so holding the key does not chain-place.
     np.input.bomb = false
+  }
+
+  /**
+   * Lay a row of bombs ahead of a networked player, up to their spare capacity.
+   * Mirrors placeLineBomb, which reads player-1 globals and so could not serve
+   * a networked player.
+   */
+  function placeNetLineBomb(np: NetPlayer): number {
+    const dx = np.lastDx
+    const dy = np.lastDy
+    const available = np.maxBombs - np.currentBombs
+    if (available <= 0) return 0
+
+    let placed = 0
+    for (let i = 0; i < available; i++) {
+      const bx = np.x + dx * i
+      const by = np.y + dy * i
+      if (bx < 0 || by < 0 || bx >= GRID_WIDTH || by >= GRID_HEIGHT) break
+      if (grid[by][bx] === 'wall' || grid[by][bx] === 'destructible') break
+      if (bombs.some(b => b.x === bx && b.y === by)) continue
+      placeBomb(bx, by, netOwnerId(np.slot), np.blastRadius)
+      placed++
+    }
+    return placed
   }
 
   /** Power-up pickup for networked players. Host only. */
@@ -5129,6 +5299,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         np.speed++
         np.moveDelay = Math.max(60, 150 - (np.speed - 1) * 30)
       }
+      // Extended pool. These were missing entirely, so online the pickup was
+      // consumed and silently discarded — strictly worse than not dropping it.
+      // Caps and durations match the offline player exactly.
+      else if (pu.type === 'shield') np.shieldCharges = Math.min(3, np.shieldCharges + 1)
+      else if (pu.type === 'pierce') np.hasPierce = true
+      else if (pu.type === 'ghost') np.ghostTimer = 8000
+      else if (pu.type === 'powerBomb') np.powerBombCharges++
+      else if (pu.type === 'lineBomb') np.hasLineBomb = true
 
       pu.mesh.dispose()
       powerUps.splice(i, 1)
@@ -5137,14 +5315,24 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     }
   }
 
+  /**
+   * Current movement direction from the keyboard or D-pad.
+   *
+   * Split out from readLocalNetInput because prediction reads the direction
+   * every frame, and must not consume the edge-triggered bomb request while
+   * doing so.
+   */
+  function readLocalMoveDirection(): { dx: number; dy: number } {
+    if (keysHeld.has('w') || keysHeld.has('W') || keysHeld.has('ArrowUp')) return { dx: -1, dy: 0 }
+    if (keysHeld.has('s') || keysHeld.has('S') || keysHeld.has('ArrowDown')) return { dx: 1, dy: 0 }
+    if (keysHeld.has('a') || keysHeld.has('A') || keysHeld.has('ArrowLeft')) return { dx: 0, dy: -1 }
+    if (keysHeld.has('d') || keysHeld.has('D') || keysHeld.has('ArrowRight')) return { dx: 0, dy: 1 }
+    return { dx: 0, dy: 0 }
+  }
+
   /** Read local controls into the local player's input slot. */
   function readLocalNetInput(): { dx: number; dy: number; bomb: boolean } {
-    let dx = 0
-    let dy = 0
-    if (keysHeld.has('w') || keysHeld.has('W') || keysHeld.has('ArrowUp')) dx = -1
-    else if (keysHeld.has('s') || keysHeld.has('S') || keysHeld.has('ArrowDown')) dx = 1
-    else if (keysHeld.has('a') || keysHeld.has('A') || keysHeld.has('ArrowLeft')) dy = -1
-    else if (keysHeld.has('d') || keysHeld.has('D') || keysHeld.has('ArrowRight')) dy = 1
+    const { dx, dy } = readLocalMoveDirection()
     const bomb = netBombRequested
     netBombRequested = false
     return { dx, dy, bomb }
@@ -5163,6 +5351,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         invulnerable: p.invulnerable,
         bombs: p.maxBombs,
         blast: p.blastRadius,
+        kick: p.hasKick,
+        throwing: p.hasThrow,
+        shield: p.shieldCharges,
+        pierce: p.hasPierce,
+        ghost: p.ghostTimer,
+        powerBomb: p.powerBombCharges,
+        lineBomb: p.hasLineBomb,
+        ackSeq: p.inputSeq,
       })),
       bombs: bombs.map(b => ({ x: b.x, y: b.y, timer: b.timer, blast: b.blastRadius })),
       powerUps: powerUps.map(p => ({ x: p.x, y: p.y, type: p.type })),
@@ -5186,15 +5382,46 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           haptic([50, 30, 80])
         }
       }
-      np.x = sp.x
-      np.y = sp.y
+      if (np.isLocal) {
+        // The local player predicts its own movement, so the host's position is
+        // only worth adopting once it has seen the input we predicted from — a
+        // snapshot built before our latest input would drag us back to where we
+        // were a round trip ago, which is the rubber-banding that made guests
+        // feel laggy in the first place.
+        //
+        // Even then, a single tile of disagreement along a held direction is
+        // just the two clocks being a tick apart and resolves itself. Only a
+        // larger gap means we genuinely diverged — blocked, kicked, or killed —
+        // and has to be corrected.
+        const acknowledged = sp.ackSeq >= lastPredictedSeq
+        const drift = Math.abs(sp.x - np.x) + Math.abs(sp.y - np.y)
+        if (acknowledged && drift > 1) {
+          np.x = sp.x
+          np.y = sp.y
+        }
+      } else {
+        np.x = sp.x
+        np.y = sp.y
+      }
+
       np.lives = sp.lives
       np.maxBombs = sp.bombs
       np.blastRadius = sp.blast
       np.invulnerable = sp.invulnerable
+      np.hasKick = sp.kick
+      np.hasThrow = sp.throwing
+      np.shieldCharges = sp.shield
+      np.hasPierce = sp.pierce
+      np.ghostTimer = sp.ghost
+      np.powerBombCharges = sp.powerBomb
+      np.hasLineBomb = sp.lineBomb
+
       if (np.alive !== sp.alive) {
         np.alive = sp.alive
         setCharacterVisibility(np.mesh, sp.alive ? 1 : 0)
+      } else if (sp.alive) {
+        // Ghosted players are see-through on every screen, not just the host's.
+        setCharacterVisibility(np.mesh, sp.ghost > 0 ? 0.5 : 1)
       }
       if (sp.dx !== 0 || sp.dy !== 0) faceDirection(np.mesh, sp.dx, sp.dy)
     }
@@ -5209,6 +5436,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         mesh.position = gridToWorld(sb.x, sb.y)
         guestBombMeshes.set(key, mesh)
       }
+      // Keep the fuse time on the mesh so the pulse can be driven per frame.
+      // The host animates bombs inside updateBombs, which guests never run, so
+      // without this a bomb just sits there inert on every screen but the
+      // host's — no wind-up, no warning that it is about to go off.
+      ;(guestBombMeshes.get(key) as any)._fuseMs = sb.timer
     }
     for (const [key, mesh] of [...guestBombMeshes]) {
       if (live.has(key)) continue
@@ -5405,7 +5637,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     if (local) local.input = { ...input, bomb: input.bomb || local.input.bomb }
 
     if (online.isHost) {
-      for (const np of netPlayers) stepNetPlayer(np, now)
+      for (const np of netPlayers) stepNetPlayer(np, now, stepMs)
 
       // Invulnerability flicker is the host's call, mirrored via the snapshot.
       for (const np of netPlayers) {
@@ -5442,11 +5674,52 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           bomb: input.bomb,
         })
       }
+
     }
+  }
+
+  /**
+   * Apply the local player's movement optimistically, under the host's rules.
+   *
+   * Deliberately movement only. Bombs, pickups and damage stay entirely with
+   * the host — predicting those would mean showing outcomes that might not
+   * survive reconciliation, and a bomb that appears and then vanishes is worse
+   * than one that appears a few frames late.
+   */
+  function predictLocalStep(np: NetPlayer, input: { dx: number; dy: number }, now: number): void {
+    const { dx, dy } = input
+    if (dx === 0 && dy === 0) return
+
+    np.lastDx = dx
+    np.lastDy = dy
+    faceDirection(np.mesh, dx, dy)
+
+    if (now - np.lastMoveTime < np.moveDelay) return
+    const tx = np.x + dx
+    const ty = np.y + dy
+    if (!netCanWalk(np, tx, ty)) return
+
+    np.x = tx
+    np.y = ty
+    np.lastMoveTime = now
+    lastPredictedSeq = localInputSeq
   }
 
   /** Visual-only: smooth meshes toward their authoritative grid position. */
   function renderOnlineVisuals(deltaTime: number): void {
+    // Predict here rather than on the simulation tick.
+    //
+    // The tick only runs every 33ms, so predicting there left a keypress
+    // waiting up to a full tick before anything moved — small, but enough to
+    // feel like the controls answer a frame late. Movement is still gated by
+    // the player's own moveDelay, so this only removes the tick quantisation.
+    if (online && !online.isHost) {
+      const me = localNetPlayer()
+      if (me && me.alive && !isPaused && !gameOver) {
+        predictLocalStep(me, readLocalMoveDirection(), Date.now())
+      }
+    }
+
     const lerp = Math.min(1, MOVE_LERP_SPEED * deltaTime / 1000)
     for (const np of netPlayers) {
       gridToWorldInPlace(np.x, np.y, _tmpGridVec)
@@ -5454,6 +5727,25 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       np.visualZ += (_tmpGridVec.z - np.visualZ) * lerp
       np.mesh.position.x = np.visualX
       np.mesh.position.z = np.visualZ
+    }
+
+    // Pulse the bombs a guest is showing.
+    //
+    // The host does this in updateBombs, which guests never run — so on every
+    // screen but the host's a bomb sat perfectly still, giving no sense that it
+    // was about to go off. The fuse arrives on each snapshot; run it down
+    // locally between them so the pulse is smooth rather than stepping at the
+    // ~15Hz snapshot rate. Same curve as the host's, so they look identical.
+    const now = Date.now()
+    for (const mesh of guestBombMeshes.values()) {
+      const remaining = ((mesh as any)._fuseMs ?? 0) - deltaTime
+      ;(mesh as any)._fuseMs = remaining
+
+      const urgency = Math.max(0, Math.min(1, 1 - remaining / 2000))
+      const pulseSpeed = 5 + urgency * 25
+      const pulseAmp = 0.06 + urgency * 0.22
+      const pulse = 1 + Math.sin((now * pulseSpeed) / 1000) * pulseAmp
+      mesh.scaling.copyFromFloats(pulse, pulse * (1 + urgency * 0.08), pulse)
     }
   }
 

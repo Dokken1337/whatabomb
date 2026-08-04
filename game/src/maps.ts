@@ -11,8 +11,6 @@ export interface MapConfig {
   colors: {
     ground: Color3
     wall: Color3
-    destructible: Color3
-    ambient: Color3
   }
   name: string
   description: string
@@ -29,8 +27,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.2, 0.45, 0.2), // More vibrant green
       wall: new Color3(0.55, 0.55, 0.6), // Brighter wall
-      destructible: new Color3(0.8, 0.7, 0.4), // Brighter wood/box content
-      ambient: new Color3(0.15, 0.25, 0.15), // Slightly brighter ambient
     },
   },
   'small-moon': {
@@ -43,8 +39,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.2, 0.2, 0.25),
       wall: new Color3(0.4, 0.4, 0.45),
-      destructible: new Color3(0.6, 0.6, 0.65),
-      ambient: new Color3(0.1, 0.1, 0.15),
     },
   },
   'small-ice': {
@@ -56,9 +50,7 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     description: 'Quick frozen battles',
     colors: {
       ground: new Color3(0.7, 0.9, 1.0), // Brighter ice
-      wall: new Color3(0.6, 0.8, 1.0), // Brighter ice wall
-      destructible: new Color3(0.9, 0.95, 1.0), // Very bright ice block
-      ambient: new Color3(0.7, 0.8, 0.9), // Bright ambient
+      wall: new Color3(0.32, 0.46, 0.62), // Dark slate, so walls read against the pale floor
     },
   },
   'small-lava': {
@@ -71,8 +63,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.4, 0.1, 0.05), // Brighter lava ground
       wall: new Color3(0.3, 0.2, 0.2), 
-      destructible: new Color3(0.8, 0.4, 0.1), // Bright hot rock
-      ambient: new Color3(0.4, 0.2, 0.1),
     },
   },
   'small-forest': {
@@ -84,9 +74,7 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     description: 'Quick woodland skirmishes',
     colors: {
       ground: new Color3(0.25, 0.55, 0.2), // Vibrant forest green
-      wall: new Color3(0.4, 0.3, 0.2), // Brighter wood wall
-      destructible: new Color3(0.6, 0.4, 0.2), // Vibrant wood
-      ambient: new Color3(0.2, 0.3, 0.15),
+      wall: new Color3(0.22, 0.15, 0.09), // Dark bark, well below the crate in value
     },
   },
   'medium-classic': {
@@ -99,8 +87,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.2, 0.45, 0.2),
       wall: new Color3(0.55, 0.55, 0.6),
-      destructible: new Color3(0.8, 0.7, 0.4),
-      ambient: new Color3(0.15, 0.25, 0.15),
     },
   },
   'medium-ice': {
@@ -112,9 +98,7 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     description: 'Frozen battlefield with icy colors',
     colors: {
       ground: new Color3(0.7, 0.9, 1.0),
-      wall: new Color3(0.6, 0.8, 1.0),
-      destructible: new Color3(0.9, 0.95, 1.0),
-      ambient: new Color3(0.7, 0.8, 0.9),
+      wall: new Color3(0.32, 0.46, 0.62), // Dark slate, so walls read against the pale floor
     },
   },
   'medium-lava': {
@@ -127,8 +111,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.4, 0.1, 0.05),
       wall: new Color3(0.3, 0.2, 0.2), 
-      destructible: new Color3(0.8, 0.4, 0.1),
-      ambient: new Color3(0.4, 0.2, 0.1),
     },
   },
   'medium-forest': {
@@ -140,9 +122,7 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     description: 'Natural battlefield with earthy colors',
     colors: {
       ground: new Color3(0.25, 0.55, 0.2),
-      wall: new Color3(0.4, 0.3, 0.2),
-      destructible: new Color3(0.6, 0.4, 0.2),
-      ambient: new Color3(0.2, 0.3, 0.15),
+      wall: new Color3(0.22, 0.15, 0.09), // Dark bark, well below the crate in value
     },
   },
   'medium-space': {
@@ -155,8 +135,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.1, 0.05, 0.2),
       wall: new Color3(0.1, 0.8, 0.9),
-      destructible: new Color3(0.4, 0.4, 0.5),
-      ambient: new Color3(0.1, 0.1, 0.3),
     },
   },
   'large-classic': {
@@ -169,8 +147,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.15, 0.35, 0.15),
       wall: new Color3(0.5, 0.5, 0.5),
-      destructible: new Color3(0.7, 0.6, 0.4),
-      ambient: new Color3(0.1, 0.2, 0.1),
     },
   },
   'large-ice': {
@@ -182,9 +158,7 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     description: 'Expansive frozen battlefield',
     colors: {
       ground: new Color3(0.7, 0.85, 0.95),
-      wall: new Color3(0.5, 0.7, 0.9),
-      destructible: new Color3(0.8, 0.9, 1.0),
-      ambient: new Color3(0.6, 0.7, 0.8),
+      wall: new Color3(0.30, 0.44, 0.60), // Dark slate, so walls read against the pale floor
     },
   },
   'large-lava': {
@@ -197,8 +171,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.3, 0.1, 0.05),
       wall: new Color3(0.2, 0.2, 0.2),
-      destructible: new Color3(0.6, 0.3, 0.1),
-      ambient: new Color3(0.3, 0.1, 0.0),
     },
   },
   'large-forest': {
@@ -210,9 +182,7 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     description: 'Sprawling woodland battleground',
     colors: {
       ground: new Color3(0.2, 0.4, 0.15),
-      wall: new Color3(0.3, 0.25, 0.2),
-      destructible: new Color3(0.5, 0.35, 0.2),
-      ambient: new Color3(0.15, 0.25, 0.1),
+      wall: new Color3(0.20, 0.14, 0.08), // Dark bark, well below the crate in value
     },
   },
   'chaos-neon': {
@@ -225,8 +195,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.05, 0.0, 0.1),
       wall: new Color3(1.0, 0.0, 0.5),
-      destructible: new Color3(0.0, 1.0, 0.8),
-      ambient: new Color3(0.2, 0.0, 0.3),
     },
   },
   'chaos-neon-large': {
@@ -239,8 +207,6 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     colors: {
       ground: new Color3(0.05, 0.0, 0.1),
       wall: new Color3(1.0, 0.0, 0.5),
-      destructible: new Color3(0.0, 1.0, 0.8),
-      ambient: new Color3(0.2, 0.0, 0.3),
     },
   },
 }
@@ -249,14 +215,5 @@ export function getMapConfig(key: string): MapConfig {
   return MAP_CONFIGS[key] || MAP_CONFIGS['medium-classic']
 }
 
-export function getAllMaps(): MapConfig[] {
-  return Object.values(MAP_CONFIGS)
-}
 
-export function getMapsBySize(size: MapSize): MapConfig[] {
-  return Object.values(MAP_CONFIGS).filter(map => map.size === size)
-}
 
-export function getMapsByTheme(theme: MapTheme): MapConfig[] {
-  return Object.values(MAP_CONFIGS).filter(map => map.theme === theme)
-}
