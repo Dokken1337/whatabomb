@@ -152,6 +152,7 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
     // Reachable only from the VNet. The Web App's VNet integration is what
     // gives it a route in; nothing else needs to talk to this cache.
     publicNetworkAccess: 'Disabled'
+    highAvailability: 'Disabled'
     privateEndpoints: [
       {
         name: 'pep-${redisName}'
