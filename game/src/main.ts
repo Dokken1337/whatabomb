@@ -3042,7 +3042,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     seed: number,
     now: number,
   ) {
-    const urgency = 1 - timer / 2000 // 0 → 1 as bomb nears detonation
+    // 0 → 1 as the bomb nears detonation. Capped at 1 for the guest's benefit:
+    // the host removes a bomb on the frame its timer runs out, but a guest runs
+    // the fuse down locally and only drops the mesh when a snapshot says the
+    // bomb is gone. If snapshots stop — a disconnect, a reconnect backoff — an
+    // uncapped urgency would keep growing and inflate the pulse and the danger
+    // ring without bound. The host never reaches the cap, so this changes
+    // nothing there.
+    const urgency = Math.min(1, 1 - timer / 2000)
 
     // ── Pulse: faster & stronger as timer runs out ──
     const pulseSpeed = 5 + urgency * 25
@@ -4587,7 +4594,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // Step immediately instead of waiting for the next frame's poll. A quick
       // mouse click can start and finish inside a single frame, which would
       // otherwise register as no input at all.
-      if (!gameOver && !isPaused) processHeldKeys()
+      //
+      // Offline only. processHeldKeys drives the player-1 globals, which online
+      // belong to the character parked invisibly at its spawn corner — so every
+      // D-pad tap walked that ghost around the arena, and because movePlayer1
+      // ends in checkPowerUps() it quietly ate pickups a real player was going
+      // for. Online needs nothing here anyway: prediction reads `keysHeld` every
+      // frame, and engageKey has just set it.
+      if (!online && !gameOver && !isPaused) processHeldKeys()
     }
 
     const createBtn = (cls: string, key: string) => {
