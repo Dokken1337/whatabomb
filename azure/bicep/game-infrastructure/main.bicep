@@ -168,24 +168,9 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
         tags: tags
       }
     ]
-    // High availability is left at the module default (Enabled).
-    //
-    // It was previously forced to 'Disabled' on the reasoning that B0 is small
-    // and losing the cache only costs in-flight lobbies. That was the one
-    // cluster-level property this template set that the known-good Yopass
-    // deployment does not, and it is the likeliest cause of the deployment
-    // failing outright — disabling HA changes the node topology, and B0 is
-    // already the smallest SKU. It cannot be turned off after creation anyway,
-    // so defaulting to on is also the recoverable choice.
     database: {
       accessKeysAuthentication: 'Enabled'
-      // A plain (non-cluster-aware) client is all the server needs, and keeping
-      // pub/sub on one shard avoids cluster-mode channel sharding entirely.
       clusteringPolicy: 'NoCluster'
-      // Lobbies must never be evicted under memory pressure — an evicted lobby
-      // is indistinguishable to a joiner from a code that never existed, which
-      // is the exact failure this whole change exists to remove.
-      evictionPolicy: 'NoEviction'
       clientProtocol: 'Encrypted'
     }
     tags: tags
