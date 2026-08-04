@@ -2,7 +2,7 @@
 targetScope = 'subscription'
 
 // INIT
-param location string = 'westeurope'
+param location string = 'belgiumcentral'
 param prefix string = 'dokken'
 param tags object = {}
 
@@ -155,6 +155,10 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
     privateEndpoints: [
       {
         name: 'pep-${redisName}'
+        // Pinned to the VNet's region, not the cache's: a private endpoint must
+        // be in the same region as its virtual network, even when the resource
+        // it targets sits elsewhere.
+        location: resourceGroupWorkLoad.outputs.location
         subnetResourceId: subnetPrivateEndpoints.id
         privateDnsZoneGroup: {
           name: 'default'
@@ -172,6 +176,7 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
       accessKeysAuthentication: 'Enabled'
       clusteringPolicy: 'NoCluster'
       clientProtocol: 'Encrypted'
+      evictionPolicy: 'NoEviction'
     }
     tags: tags
     enableTelemetry: false

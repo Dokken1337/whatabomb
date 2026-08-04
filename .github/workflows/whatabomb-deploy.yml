@@ -36,7 +36,7 @@ permissions:
 
 env:
     environment: 'prod'
-    location: 'westeurope'
+    location: 'belgiumcentral'
     subscriptionId: ${{ vars.AZURE_SUBSCRIPTION_ID }} 
     ########
     # MISC #

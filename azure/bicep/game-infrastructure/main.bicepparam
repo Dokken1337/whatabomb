@@ -1,6 +1,6 @@
 using './main.bicep'
 
-param location = 'westeurope'
+param location = 'belgiumcentral'
 param prefix = 'dokken'
 param workload = 'whatabomb'
 
