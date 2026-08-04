@@ -69,7 +69,7 @@ resource resourceGroupNetwork 'Microsoft.Resources/resourceGroups@2025-04-01' ex
   name: resourceGroupNetworkName
 }
 resource virtualNetwork 'Microsoft.Network/virtualNetworks@2025-07-01' existing = {
-  name: 'vnet-core-swedencentral'
+  name: 'vnet-core-${location}'
   scope: az.resourceGroup(resourceGroupNetwork.name)
 }
 resource subnetWebApp 'Microsoft.Network/virtualNetworks/subnets@2025-07-01' existing = {
