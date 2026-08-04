@@ -5029,14 +5029,23 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   /** Keep the camera on a target, clamped so it never shows outside the arena. */
   function followCamera(targetX: number, targetZ: number): void {
-    // Read the horizontal extent back off the camera: aspect correction can
-    // widen the box past viewportHalfWidth, and panning to a stale, narrower
-    // limit would scroll empty space in from the side.
-    const visibleHalfWidth = (camera.orthoRight! - camera.orthoLeft!) / 2
-    const minX = -halfWorldWidth - margin + visibleHalfWidth
-    const maxX = halfWorldWidth + margin - visibleHalfWidth
-    const minZ = -halfWorldHeight - margin + viewportHalfHeight
-    const maxZ = halfWorldHeight + margin - viewportHalfHeight
+    // The screen axes are transposed relative to the world: world X runs *down*
+    // the screen and world Z *across* it (see gridToWorld). So the camera's
+    // vertical extent bounds X and its horizontal extent bounds Z.
+    //
+    // Pairing them the other way round is not a rounding error, it disables the
+    // follow entirely: on a phone the box is tall and narrow, so using the
+    // vertical extent for Z made the Z limits collapse to zero and pinned the
+    // camera on exactly the axis the zoom crops. Read off the camera rather
+    // than from viewportHalf*, because the framing resizes the box to the
+    // viewport.
+    const halfExtentX = (camera.orthoTop! - camera.orthoBottom!) / 2
+    const halfExtentZ = (camera.orthoRight! - camera.orthoLeft!) / 2
+
+    const minX = -halfWorldWidth - margin + halfExtentX
+    const maxX = halfWorldWidth + margin - halfExtentX
+    const minZ = -halfWorldHeight - margin + halfExtentZ
+    const maxZ = halfWorldHeight + margin - halfExtentZ
 
     // When the viewport is wider than the world there is nothing to pan to.
     const clampedX = minX > maxX ? 0 : Math.max(minX, Math.min(maxX, targetX))

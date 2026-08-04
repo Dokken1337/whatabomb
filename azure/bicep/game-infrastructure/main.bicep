@@ -42,7 +42,7 @@ Azure Managed Redis SKU. Balanced_B0 is the smallest tier and is ample: the only
 thing stored is a handful of small lobby records, plus pub/sub traffic that is
 never retained.
 ''')
-param redisSkuName string = 'Balanced_B0'
+param redisSkuName string // = 'Balanced_B0'
 
 @description('Linux runtime stack for the Web App.')
 param linuxFxVersion string = 'NODE|22-lts'
