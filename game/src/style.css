@@ -14,12 +14,33 @@ html, body {
 
 body {
   background-color: #050510;
-  background-image: 
+  background-image:
     linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
     linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
   background-size: 100% 2px, 3px 100%;
   font-family: 'Russo One', sans-serif;
   color: white;
+
+  /* None of this is text anyone wants to select, and on a touch screen a held
+     virtual button is one gesture away from being a text selection: pressing
+     the D-pad highlighted whatever HUD text sat under or near it and raised
+     iOS's copy callout, on top of the game.
+     This has to live on body rather than on #app — the HUD panels, the D-pad
+     and the pause button are all appended straight to <body>, so the callout
+     rule already on #app never reached any of them. Selection is handed back
+     below, only where it is actually wanted. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Anything the player genuinely types into or copies out of. */
+input,
+textarea,
+[contenteditable] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 #app {
@@ -1022,7 +1043,11 @@ body {
   color: #ffae00;
   text-shadow: 0 0 18px rgba(255, 174, 0, 0.5);
   cursor: pointer;
+  /* The one piece of text on any screen that exists to be copied — it has to
+     opt back out of the page-wide selection lock above. */
+  -webkit-user-select: all;
   user-select: all;
+  -webkit-touch-callout: default;
   padding: 6px 0;
 }
 

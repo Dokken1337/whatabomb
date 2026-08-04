@@ -2521,7 +2521,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
             <span style="font-size: 14px; font-weight: bold;">${me.lives}/${startingLives}</span>
           </div>
           ${healthBarHTML(me.lives, startingLives)}
-          ${powerupIconsHTML(me.maxBombs, me.blastRadius, me.hasKick, me.hasThrow, me.speed, 0, false, 0, 0, false)}
+          ${powerupIconsHTML(me.maxBombs, me.blastRadius, me.hasKick, me.hasThrow, me.speed,
+            me.shieldCharges, me.hasPierce, me.ghostTimer, me.powerBombCharges, me.hasLineBomb)}
         `
       }
 
@@ -3010,11 +3011,122 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return bombBody
   }
 
-  // Cache spark and danger-ring mesh refs on a bomb object for per-frame access
-  function cacheBombChildRefs(bomb: any) {
-    const children = bomb.mesh.getChildMeshes()
-    bomb._spark = children.find((m: any) => m.name === 'spark') || null
-    bomb._dangerRing = children.find((m: any) => m.name === 'danger-ring') || null
+  // Cache spark and danger-ring mesh refs for per-frame access. The host hangs
+  // them off its bomb record; guests have no such record, so they hang them off
+  // the mesh itself — hence the separate target.
+  function cacheBombChildRefs(target: any, mesh: any = target.mesh) {
+    const children = mesh.getChildMeshes()
+    target._spark = children.find((m: any) => m.name === 'spark') || null
+    target._dangerRing = children.find((m: any) => m.name === 'danger-ring') || null
+  }
+
+  /**
+   * One frame of bomb visuals: pulse, body glow, spark flicker, danger ring and
+   * wobble.
+   *
+   * Shared on purpose. The host drives this from updateBombs; guests never
+   * simulate, so they have to reproduce it from the fuse time carried in the
+   * snapshot. Every previous attempt at that was a hand-copied subset which
+   * quietly drifted from this one — which is why a bomb on a guest's screen had
+   * no orange glow and no danger ring, the two things that actually say "this is
+   * about to go off". One function means they cannot disagree again.
+   *
+   * `timer` is milliseconds left on the fuse. `seed` only offsets the wobble and
+   * names cloned materials, so any stable per-bomb number will do.
+   */
+  function animateBombVisuals(
+    mesh: any,
+    spark: any,
+    dangerRing: any,
+    timer: number,
+    seed: number,
+    now: number,
+  ) {
+    const urgency = 1 - timer / 2000 // 0 → 1 as bomb nears detonation
+
+    // ── Pulse: faster & stronger as timer runs out ──
+    const pulseSpeed = 5 + urgency * 25
+    const pulseAmp = 0.06 + urgency * 0.22
+    const pulse = 1 + Math.sin(now * pulseSpeed / 1000) * pulseAmp
+    mesh.scaling.copyFromFloats(pulse, pulse * (1 + urgency * 0.08), pulse)
+
+    // ── Body glow: ramp from dark to angry red/orange ──
+    if (mesh.material && mesh.material !== sharedBombMat) {
+      // power-bomb or already-cloned material – animate glow
+      if (urgency > 0.4) {
+        const i2 = (urgency - 0.4) / 0.6
+        mesh.material.emissiveColor.copyFromFloats(
+          Math.min(1, i2 * 0.9 + (mesh.material.emissiveColor.r > 0.3 ? 0.4 : 0)),
+          i2 * 0.15 + (mesh.material.emissiveColor.g > 0.2 ? 0.15 : 0),
+          0
+        )
+      }
+    } else if (mesh.material) {
+      if (urgency > 0.4) {
+        const i2 = (urgency - 0.4) / 0.6
+        // Clone material once to avoid tinting all bombs the same
+        mesh.material = sharedBombMat.clone('bomb-mat-' + seed)!
+        mesh.material.emissiveColor.copyFromFloats(i2 * 0.9, i2 * 0.15, 0)
+      }
+    }
+
+    // ── Spark flicker: use cached ref ──
+    if (spark) {
+      const f = 0.6 + Math.random() * 0.4
+      const s = 0.7 + Math.random() * 0.6
+      spark.scaling.copyFromFloats(s, s, s)
+      if (spark.material && spark.material !== sharedSparkMat) {
+        spark.material.emissiveColor.copyFromFloats(f, f * 0.55, f * 0.1)
+      } else if (spark.material) {
+        // Clone once
+        const sm = sharedSparkMat.clone('spark-live-' + seed)!
+        spark.material = sm
+        sm.emissiveColor.copyFromFloats(f, f * 0.55, f * 0.1)
+      }
+    }
+
+    // ── Danger ring: use cached ref ──
+    if (dangerRing) {
+      if (urgency > 0.6) {
+        const dp = (urgency - 0.6) / 0.4 // 0→1
+        const ringScale = 1 + dp * 1.5
+        dangerRing.scaling.copyFromFloats(ringScale, ringScale, ringScale)
+        if (dangerRing.material && dangerRing.material !== sharedDangerMat) {
+          dangerRing.material.alpha = dp * 0.6 * (0.5 + 0.5 * Math.sin(now * 0.012))
+        } else if (dangerRing.material) {
+          const dm = sharedDangerMat.clone('danger-live-' + seed)!
+          dangerRing.material = dm
+          dm.alpha = dp * 0.6
+        }
+      }
+    }
+
+    // ── Slight wobble for personality ──
+    mesh.rotation.z = Math.sin(now * 0.008 + seed) * urgency * 0.12
+    mesh.rotation.x = Math.cos(now * 0.006 + seed) * urgency * 0.08
+  }
+
+  /**
+   * Release the per-bomb material clones animateBombVisuals made.
+   *
+   * Called from both teardown paths. Guests used to drop the mesh and leave the
+   * clone behind, so a long round quietly accumulated a StandardMaterial per
+   * bomb that ever got close to going off.
+   */
+  function disposeBombMaterials(mesh: any) {
+    if (mesh.material && mesh.material !== sharedBombMat) mesh.material.dispose()
+    mesh.getChildMeshes().forEach((child: any) => {
+      if (
+        child.material &&
+        child.material !== sharedBombMat &&
+        child.material !== sharedFuseMat &&
+        child.material !== sharedRivetMat &&
+        child.material !== sharedSparkMat &&
+        child.material !== sharedDangerMat
+      ) {
+        child.material.dispose()
+      }
+    })
   }
 
   // Place bomb function (for player 1 or enemies)
@@ -3771,86 +3883,20 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       const bomb = bombs[i]
       bomb.timer -= deltaTime
 
-      const timeRatio = bomb.timer / 2000
-      const urgency = 1 - timeRatio // 0 → 1 as bomb nears detonation
-
-      // ── Pulse: faster & stronger as timer runs out ──
-      const pulseSpeed = 5 + urgency * 25
-      const pulseAmp = 0.06 + urgency * 0.22
-      const pulse = 1 + Math.sin(now * pulseSpeed / 1000) * pulseAmp
-      bomb.mesh.scaling.copyFromFloats(pulse, pulse * (1 + urgency * 0.08), pulse)
-
-      // ── Body glow: ramp from dark to angry red/orange ──
-      if (bomb.mesh.material && bomb.mesh.material !== sharedBombMat) {
-        // power-bomb or already-cloned material – animate glow
-        if (urgency > 0.4) {
-          const i2 = (urgency - 0.4) / 0.6
-          bomb.mesh.material.emissiveColor.copyFromFloats(
-            Math.min(1, i2 * 0.9 + (bomb.mesh.material.emissiveColor.r > 0.3 ? 0.4 : 0)),
-            i2 * 0.15 + (bomb.mesh.material.emissiveColor.g > 0.2 ? 0.15 : 0),
-            0
-          )
-        }
-      } else if (bomb.mesh.material) {
-        if (urgency > 0.4) {
-          const i2 = (urgency - 0.4) / 0.6
-          // Clone material once to avoid tinting all bombs the same
-          if (bomb.mesh.material === sharedBombMat) {
-            const m = sharedBombMat.clone('bomb-mat-' + i)!
-            bomb.mesh.material = m
-          }
-          bomb.mesh.material.emissiveColor.copyFromFloats(i2 * 0.9, i2 * 0.15, 0)
-        }
-      }
-
-      // ── Spark flicker: use cached ref ──
-      const spark = (bomb as any)._spark
-      if (spark) {
-        const f = 0.6 + Math.random() * 0.4
-        const s = 0.7 + Math.random() * 0.6
-        spark.scaling.copyFromFloats(s, s, s)
-        if (spark.material && spark.material !== sharedSparkMat) {
-          spark.material.emissiveColor.copyFromFloats(f, f * 0.55, f * 0.1)
-        } else if (spark.material) {
-          // Clone once
-          const sm = sharedSparkMat.clone('spark-live-' + i)!
-          spark.material = sm
-          sm.emissiveColor.copyFromFloats(f, f * 0.55, f * 0.1)
-        }
-      }
-
-      // ── Danger ring: use cached ref ──
-      const dangerRing = (bomb as any)._dangerRing
-      if (dangerRing) {
-        if (urgency > 0.6) {
-          const dp = (urgency - 0.6) / 0.4 // 0→1
-          const ringScale = 1 + dp * 1.5
-          dangerRing.scaling.copyFromFloats(ringScale, ringScale, ringScale)
-          if (dangerRing.material && dangerRing.material !== sharedDangerMat) {
-            dangerRing.material.alpha = dp * 0.6 * (0.5 + 0.5 * Math.sin(now * 0.012))
-          } else if (dangerRing.material) {
-            const dm = sharedDangerMat.clone('danger-live-' + i)!
-            dangerRing.material = dm
-            dm.alpha = dp * 0.6
-          }
-        }
-      }
-
-      // ── Slight wobble for personality ── 
-      bomb.mesh.rotation.z = Math.sin(now * 0.008 + i) * urgency * 0.12
-      bomb.mesh.rotation.x = Math.cos(now * 0.006 + i) * urgency * 0.08
+      animateBombVisuals(
+        bomb.mesh,
+        (bomb as any)._spark,
+        (bomb as any)._dangerRing,
+        bomb.timer,
+        i,
+        now,
+      )
 
       if (bomb.timer <= 0) {
         explodeBomb(bomb)
         // Dispose cloned materials to prevent memory leaks
-        // Dispose cloned body material
-        if (bomb.mesh.material && bomb.mesh.material !== sharedBombMat) bomb.mesh.material.dispose()
-        bomb.mesh.getChildMeshes().forEach((child: any) => {
-          if (child.material && child.material !== sharedBombMat && child.material !== sharedFuseMat && child.material !== sharedRivetMat && child.material !== sharedSparkMat && child.material !== sharedDangerMat) {
-            child.material.dispose()
-          }
-          child.dispose()
-        })
+        disposeBombMaterials(bomb.mesh)
+        bomb.mesh.getChildMeshes().forEach((child: any) => child.dispose())
         bomb.mesh.dispose()
         
         // Decrement the correct owner's bomb count
@@ -5189,6 +5235,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   let lastSentInput = ''
   let lastSnapshotAt = 0
   let roundReported = false
+  /** Fingerprint of the last HUD state a guest drew. See hudSignature. */
+  let lastHudSignature = ''
   /**
    * Sequence number of the newest input this guest has already acted on locally.
    *
@@ -5199,12 +5247,30 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   let lastPredictedSeq = -1
   /** Bomb meshes a guest is showing, keyed by the host's bomb id. */
   const guestBombMeshes = new Map<number, any>()
+  /** `x,y` of every bomb in the last snapshot, so prediction can see them. */
+  const guestBombTiles = new Set<string>()
   const guestPowerUpMeshes = new Map<string, any>()
 
   const SNAPSHOT_INTERVAL_MS = 66 // ~15Hz
   const ONLINE_TICK_MS = 33 // ~30Hz simulation, independent of frame rate
   /** How long the host lets the final explosion play before ending the round. */
   const ROUND_OVER_GRACE_MS = 1300
+
+  /**
+   * Is a bomb standing on this tile?
+   *
+   * The host owns `bombs`; on a guest that array is always empty, because
+   * guests never place anything — the bombs they can see live in
+   * `guestBombTiles`, rebuilt from each snapshot. Reading `bombs` on a guest
+   * therefore made movement prediction blind to bombs and walked the local
+   * player straight onto one, which the host then refused. Every step near your
+   * own bomb had to be corrected back, which is the worst possible place to be
+   * unsure where you are standing.
+   */
+  function bombOnTile(tx: number, ty: number): boolean {
+    if (online && !online.isHost) return guestBombTiles.has(`${tx},${ty}`)
+    return bombs.some(b => b.x === tx && b.y === ty)
+  }
 
   /**
    * Can this networked player step onto the tile?
@@ -5216,7 +5282,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     const ghosting = np.ghostTimer > 0
     if (grid[ty][tx] === 'wall') return false
     if (grid[ty][tx] === 'destructible' && !ghosting) return false
-    if (!ghosting && bombs.some(b => b.x === tx && b.y === ty)) return false
+    if (!ghosting && bombOnTile(tx, ty)) return false
     return !netPlayers.some(other => other !== np && other.alive && other.x === tx && other.y === ty)
   }
 
@@ -5361,9 +5427,13 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         alive: p.alive,
         dx: p.lastDx,
         dy: p.lastDy,
+        // Held direction, not facing: facing never returns to zero, so it can
+        // only say which way someone is pointing, never whether they are walking.
+        moving: p.alive && (p.input.dx !== 0 || p.input.dy !== 0),
         invulnerable: p.invulnerable,
         bombs: p.maxBombs,
         blast: p.blastRadius,
+        speed: p.speed,
         kick: p.hasKick,
         throwing: p.hasThrow,
         shield: p.shieldCharges,
@@ -5379,6 +5449,27 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       cleared: pendingCleared.splice(0),
     }
     return snapshot
+  }
+
+  /**
+   * Fingerprint of everything the HUD actually draws.
+   *
+   * applySnapshot used to mark the UI dirty on every snapshot, which put a full
+   * innerHTML rebuild of both panels — health bars, a dozen emoji power-up tiles
+   * and the whole roster — on very nearly every frame. Fifteen-plus DOM rebuilds
+   * a second is a cost the host never pays, because it only marks the UI dirty
+   * when something really changed, and it is a large part of why guests felt
+   * heavy on phones. Ghost is rounded to the second it is displayed at, so its
+   * countdown does not defeat the whole comparison.
+   */
+  function hudSignature(snapshot: WorldSnapshot): string {
+    let sig = ''
+    for (const sp of snapshot.players) {
+      sig += `${sp.lives},${sp.alive ? 1 : 0},${sp.bombs},${sp.blast},${sp.speed},` +
+        `${sp.kick ? 1 : 0}${sp.throwing ? 1 : 0}${sp.pierce ? 1 : 0}${sp.lineBomb ? 1 : 0},` +
+        `${sp.shield},${sp.powerBomb},${Math.ceil(sp.ghost / 1000)};`
+    }
+    return sig
   }
 
   /** Guests reconcile their world to the host's snapshot. */
@@ -5406,9 +5497,18 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         // just the two clocks being a tick apart and resolves itself. Only a
         // larger gap means we genuinely diverged — blocked, kicked, or killed —
         // and has to be corrected.
+        //
+        // Once the host has seen our *newest* input and we are no longer
+        // holding a direction, that reasoning runs out: nothing is in flight
+        // that could explain a difference, so the host is simply right. Letting
+        // a tile stand there left guests parked one square from where the host
+        // had them, which only ever surfaces as an explosion that kills you
+        // from the tile next door.
         const acknowledged = sp.ackSeq >= lastPredictedSeq
         const drift = Math.abs(sp.x - np.x) + Math.abs(sp.y - np.y)
-        if (acknowledged && drift > 1) {
+        const held = readLocalMoveDirection()
+        const settled = sp.ackSeq >= localInputSeq && held.dx === 0 && held.dy === 0
+        if (acknowledged && (drift > 1 || (settled && drift > 0))) {
           np.x = sp.x
           np.y = sp.y
         }
@@ -5420,6 +5520,13 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       np.lives = sp.lives
       np.maxBombs = sp.bombs
       np.blastRadius = sp.blast
+      // Speed gates how often prediction may step, so it has to track the host.
+      // Without it a guest kept stepping every 150ms after picking up Speed
+      // while the host ran them at up to 60ms — so every snapshot arrived one to
+      // three tiles ahead and dragged them forward, which is what read as
+      // "moved too far" and as lag.
+      np.speed = sp.speed
+      np.moveDelay = Math.max(60, 150 - (sp.speed - 1) * 30)
       np.invulnerable = sp.invulnerable
       np.hasKick = sp.kick
       np.hasThrow = sp.throwing
@@ -5436,7 +5543,15 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         // Ghosted players are see-through on every screen, not just the host's.
         setCharacterVisibility(np.mesh, sp.ghost > 0 ? 0.5 : 1)
       }
-      if (sp.dx !== 0 || sp.dy !== 0) faceDirection(np.mesh, sp.dx, sp.dy)
+      // Walk cycle, gated on `moving` rather than on facing.
+      //
+      // faceDirection starts the walk animation and arms a 180ms timer to end
+      // it. sp.dx/sp.dy are the last direction *faced* and never return to zero
+      // once someone has moved, so calling this on every snapshot re-armed that
+      // timer 15 times a second and no character on a guest's screen ever
+      // stopped jogging. The local player is left out entirely: prediction
+      // already animates it, from input that has not been round-tripped.
+      if (!np.isLocal && sp.moving) faceDirection(np.mesh, sp.dx, sp.dy)
     }
 
     // Bombs, tracked by identity rather than by tile.
@@ -5446,17 +5561,28 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     // one popped into being at the destination. With an id the same mesh
     // survives the move and can be slid across, matching what the host draws.
     const live = new Set<number>()
+    guestBombTiles.clear()
     for (const sb of snapshot.bombs) {
       live.add(sb.id)
+      guestBombTiles.add(`${sb.x},${sb.y}`)
       let mesh = guestBombMeshes.get(sb.id)
       const target = gridToWorld(sb.x, sb.y)
 
       if (!mesh) {
         mesh = createBombMesh()
         mesh.position = target
+        // The host caches these on its bomb record; guests have no record, so
+        // the mesh carries them. Without them animateBombVisuals gets no spark
+        // and no danger ring.
+        cacheBombChildRefs(mesh, mesh)
         guestBombMeshes.set(sb.id, mesh)
-      } else if (mesh.position.x !== target.x || mesh.position.z !== target.z) {
+      } else if (mesh._targetX !== target.x || mesh._targetZ !== target.z) {
         // It moved: slide it, same shape of animation the host uses for a kick.
+        //
+        // Compared against the last *target*, not the live position: the slide
+        // takes longer than the gap between snapshots, so comparing against a
+        // still-animating position restarted it on every snapshot and stacked an
+        // Animatable per frame for the whole time a bomb was in motion.
         const travel = new Animation('bombTravel', 'position', 30, Animation.ANIMATIONTYPE_VECTOR3)
         travel.setKeys([
           { frame: 0, value: mesh.position.clone() },
@@ -5465,6 +5591,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         mesh.animations = [travel]
         scene.beginAnimation(mesh, 0, 8, false)
       }
+      mesh._targetX = target.x
+      mesh._targetZ = target.z
 
       // Keep the fuse time on the mesh so the pulse can be driven per frame.
       // The host animates bombs inside updateBombs, which guests never run, so
@@ -5474,6 +5602,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     }
     for (const [key, mesh] of [...guestBombMeshes]) {
       if (live.has(key)) continue
+      disposeBombMaterials(mesh)
       mesh.getChildMeshes().forEach((c: any) => c.dispose())
       mesh.dispose()
       guestBombMeshes.delete(key)
@@ -5512,7 +5641,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       guestPowerUpMeshes.delete(key)
     }
 
-    updateUI()
+    const signature = hudSignature(snapshot)
+    if (signature !== lastHudSignature) {
+      lastHudSignature = signature
+      updateUI()
+    }
   }
 
   /**
@@ -5759,23 +5892,19 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       np.mesh.position.z = np.visualZ
     }
 
-    // Pulse the bombs a guest is showing.
+    // Bomb visuals for the bombs a guest is showing.
     //
-    // The host does this in updateBombs, which guests never run — so on every
-    // screen but the host's a bomb sat perfectly still, giving no sense that it
-    // was about to go off. The fuse arrives on each snapshot; run it down
-    // locally between them so the pulse is smooth rather than stepping at the
-    // ~15Hz snapshot rate. Same curve as the host's, so they look identical.
+    // The host drives these from updateBombs, which guests never run — so on
+    // every screen but the host's a bomb sat perfectly still, giving no sense
+    // that it was about to go off. The fuse arrives on each snapshot; run it
+    // down locally between them so the wind-up is smooth rather than stepping at
+    // the ~15Hz snapshot rate, and hand it to the same function the host uses so
+    // the glow, spark, danger ring and wobble cannot drift apart again.
     const now = Date.now()
-    for (const mesh of guestBombMeshes.values()) {
+    for (const [id, mesh] of guestBombMeshes) {
       const remaining = ((mesh as any)._fuseMs ?? 0) - deltaTime
       ;(mesh as any)._fuseMs = remaining
-
-      const urgency = Math.max(0, Math.min(1, 1 - remaining / 2000))
-      const pulseSpeed = 5 + urgency * 25
-      const pulseAmp = 0.06 + urgency * 0.22
-      const pulse = 1 + Math.sin((now * pulseSpeed) / 1000) * pulseAmp
-      mesh.scaling.copyFromFloats(pulse, pulse * (1 + urgency * 0.08), pulse)
+      animateBombVisuals(mesh, (mesh as any)._spark, (mesh as any)._dangerRing, remaining, id, now)
     }
   }
 

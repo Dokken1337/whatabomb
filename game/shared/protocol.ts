@@ -249,9 +249,26 @@ export interface SnapshotPlayer {
   /** Facing, so remote characters animate the right way. */
   dx: number
   dy: number
+  /**
+   * True while this player is actually holding a direction.
+   *
+   * Separate from `dx`/`dy`, which are the *last* direction faced and so never
+   * return to zero once someone has moved. Driving the walk cycle off those
+   * left every character on a guest's screen jogging on the spot forever.
+   */
+  moving: boolean
   invulnerable: boolean
   bombs: number
   blast: number
+  /**
+   * Speed level, which sets how often this player may step.
+   *
+   * Guests predict their own movement from their local move delay, so leaving
+   * this out of the snapshot meant a guest kept stepping at the base rate after
+   * picking up Speed while the host ran them at up to 2.5x that. Every snapshot
+   * then arrived a tile or two ahead and yanked them forward.
+   */
+  speed: number
   /** Extended power-up state, so guests render and score it the same way. */
   kick: boolean
   throwing: boolean
