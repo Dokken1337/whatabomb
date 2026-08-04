@@ -119,7 +119,7 @@ module appServicePlan 'br/public:avm/res/web/serverfarm:0.7.0' = {
 // endpoint's own DNS zone group writes the A record into it, and the VNet link
 // is what lets the Web App resolve the cache to its private address instead of
 // its public one.
-module redisPrivateDnsZone 'br/public:avm/res/network/private-dns-zone:0.7.0' = {
+module redisPrivateDnsZone 'br/public:avm/res/network/private-dns-zone:0.8.1' = {
   scope: az.resourceGroup(resourceGroupName)
   name: 'redisDnsZoneDeployment-${prefix}-${workload}'
   params: {
@@ -156,10 +156,11 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
       {
         name: 'pep-${redisName}'
         subnetResourceId: subnetPrivateEndpoints.id
-        service: 'redisEnterprise'
         privateDnsZoneGroup: {
+          name: 'default'
           privateDnsZoneGroupConfigs: [
             {
+              name: 'privatelink-redis'
               privateDnsZoneResourceId: redisPrivateDnsZone.outputs.resourceId
             }
           ]
@@ -167,20 +168,27 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
         tags: tags
       }
     ]
-    // B0 is a single node and does not offer replicas. Losing the cache drops
-    // in-flight lobbies, which is survivable — a match is minutes long and
-    // players simply make a new code.
-    highAvailability: 'Disabled'
+    // High availability is left at the module default (Enabled).
+    //
+    // It was previously forced to 'Disabled' on the reasoning that B0 is small
+    // and losing the cache only costs in-flight lobbies. That was the one
+    // cluster-level property this template set that the known-good Yopass
+    // deployment does not, and it is the likeliest cause of the deployment
+    // failing outright — disabling HA changes the node topology, and B0 is
+    // already the smallest SKU. It cannot be turned off after creation anyway,
+    // so defaulting to on is also the recoverable choice.
     database: {
+      accessKeysAuthentication: 'Enabled'
       // A plain (non-cluster-aware) client is all the server needs, and keeping
       // pub/sub on one shard avoids cluster-mode channel sharding entirely.
       clusteringPolicy: 'NoCluster'
       // Lobbies must never be evicted under memory pressure — an evicted lobby
       // is indistinguishable to a joiner from a code that never existed, which
-      // is the exact failure this whole change exists to remove.
+      // is the exact failure this whole change exists to remove. This is the one
+      // property here that the working Yopass config does not set; if the
+      // deployment still fails, drop it next to isolate the cause.
       evictionPolicy: 'NoEviction'
       clientProtocol: 'Encrypted'
-      accessKeysAuthentication: 'Enabled'
     }
     tags: tags
     enableTelemetry: false
