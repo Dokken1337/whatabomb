@@ -354,6 +354,12 @@ export function createLobbyScreen(options: LobbyScreenOptions): HTMLDivElement {
       })
     },
     onState: state => {
+      if (state === 'reconnecting') {
+        // The seat is held for a short grace period, so say we are trying
+        // rather than dumping the player straight back to the code entry.
+        status.textContent = 'Connection lost — reconnecting…'
+        return
+      }
       if (state === 'closed') {
         status.textContent = 'Disconnected'
         showChoice()

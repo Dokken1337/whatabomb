@@ -376,6 +376,43 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
       return
     }
 
+    case 'resume': {
+      // A returning client reclaiming the seat held for it by handleDisconnect.
+      if (connection.lobbyCode) {
+        sendError(socket, 'already_in_lobby', 'Leave your current lobby first')
+        return
+      }
+      if (!isValidLobbyCode(message.code) || typeof message.playerId !== 'string') {
+        sendError(socket, 'bad_request', 'Malformed resume')
+        return
+      }
+
+      const resumed = await store.withLock(message.code, async () => {
+        const lobby = await store.get(message.code)
+        if (!lobby) return null
+        const player = findPlayer(lobby, message.playerId)
+        if (!player) return null
+
+        player.connected = true
+        player.disconnectedAt = null
+        await store.set(lobby.code, lobby)
+        return lobby
+      })
+
+      if (!resumed) {
+        // The seat is gone — the grace period lapsed or the lobby closed. Say
+        // so plainly so the client stops retrying and offers a fresh start.
+        sendError(socket, 'not_in_lobby', 'That match has moved on without you')
+        return
+      }
+
+      connection.lobbyCode = resumed.code
+      connection.playerId = message.playerId
+      send(socket, { t: 'joined', youId: message.playerId, lobby: toView(resumed) })
+      broadcastLobby(resumed)
+      return
+    }
+
     case 'leave': {
       await handleDisconnect(connection, { immediate: true })
       connection.lobbyCode = null

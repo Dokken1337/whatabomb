@@ -97,6 +97,15 @@ interface PowerUp {
 }
 
 interface Bomb {
+  /**
+   * Stable identity, never reused.
+   *
+   * Guests used to track bombs by tile, which cannot distinguish "this bomb
+   * moved" from "one bomb vanished and another appeared" — so a kicked or
+   * thrown bomb was disposed and re-created at the destination, popping into
+   * existence instead of travelling.
+   */
+  id: number
   x: number
   y: number
   timer: number
@@ -2151,6 +2160,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   // Game state
   const bombs: Bomb[] = []
+  /** Source of bomb identities. Monotonic, never reused within a scene. */
+  let nextBombId = 1
   const powerUps: PowerUp[] = []
   let gameOver = false
   let gameWon = false
@@ -3037,6 +3048,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     }
 
     bombs.push({
+      id: nextBombId++,
       x,
       y,
       timer: 2000, // 2.0 seconds
@@ -3084,7 +3096,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       bombMesh.position = gridToWorld(bx, by)
 
       const br = isP1 ? blastRadius : isP2 ? player2BlastRadius : 2
-      bombs.push({ x: bx, y: by, timer: 2200, mesh: bombMesh, blastRadius: br, ownerId })
+      bombs.push({ id: nextBombId++, x: bx, y: by, timer: 2200, mesh: bombMesh, blastRadius: br, ownerId })
       cacheBombChildRefs(bombs[bombs.length - 1])
       placed++
       if (soundManager) soundManager.playSFX('bomb-place')
@@ -4420,6 +4432,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     }
 
     bombs.push({
+      id: nextBombId++,
       x,
       y,
       timer: 2200,
@@ -5184,8 +5197,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * this input, so a snapshot in flight cannot undo a move we have shown.
    */
   let lastPredictedSeq = -1
-  /** Bomb meshes a guest is showing, keyed by tile. */
-  const guestBombMeshes = new Map<string, any>()
+  /** Bomb meshes a guest is showing, keyed by the host's bomb id. */
+  const guestBombMeshes = new Map<number, any>()
   const guestPowerUpMeshes = new Map<string, any>()
 
   const SNAPSHOT_INTERVAL_MS = 66 // ~15Hz
@@ -5360,7 +5373,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         lineBomb: p.hasLineBomb,
         ackSeq: p.inputSeq,
       })),
-      bombs: bombs.map(b => ({ x: b.x, y: b.y, timer: b.timer, blast: b.blastRadius })),
+      bombs: bombs.map(b => ({ id: b.id, x: b.x, y: b.y, timer: b.timer, blast: b.blastRadius })),
       powerUps: powerUps.map(p => ({ x: p.x, y: p.y, type: p.type })),
       blasts: pendingBlasts.splice(0),
       cleared: pendingCleared.splice(0),
@@ -5426,21 +5439,38 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       if (sp.dx !== 0 || sp.dy !== 0) faceDirection(np.mesh, sp.dx, sp.dy)
     }
 
-    // Bombs: create meshes for new tiles, drop meshes for tiles that cleared.
-    const live = new Set<string>()
+    // Bombs, tracked by identity rather than by tile.
+    //
+    // Keyed by tile, a kicked or thrown bomb looked like one bomb disappearing
+    // and another appearing: the mesh was disposed at the old tile and a fresh
+    // one popped into being at the destination. With an id the same mesh
+    // survives the move and can be slid across, matching what the host draws.
+    const live = new Set<number>()
     for (const sb of snapshot.bombs) {
-      const key = `${sb.x},${sb.y}`
-      live.add(key)
-      if (!guestBombMeshes.has(key)) {
-        const mesh = createBombMesh()
-        mesh.position = gridToWorld(sb.x, sb.y)
-        guestBombMeshes.set(key, mesh)
+      live.add(sb.id)
+      let mesh = guestBombMeshes.get(sb.id)
+      const target = gridToWorld(sb.x, sb.y)
+
+      if (!mesh) {
+        mesh = createBombMesh()
+        mesh.position = target
+        guestBombMeshes.set(sb.id, mesh)
+      } else if (mesh.position.x !== target.x || mesh.position.z !== target.z) {
+        // It moved: slide it, same shape of animation the host uses for a kick.
+        const travel = new Animation('bombTravel', 'position', 30, Animation.ANIMATIONTYPE_VECTOR3)
+        travel.setKeys([
+          { frame: 0, value: mesh.position.clone() },
+          { frame: 8, value: target },
+        ])
+        mesh.animations = [travel]
+        scene.beginAnimation(mesh, 0, 8, false)
       }
+
       // Keep the fuse time on the mesh so the pulse can be driven per frame.
       // The host animates bombs inside updateBombs, which guests never run, so
       // without this a bomb just sits there inert on every screen but the
       // host's — no wind-up, no warning that it is about to go off.
-      ;(guestBombMeshes.get(key) as any)._fuseMs = sb.timer
+      ;(mesh as any)._fuseMs = sb.timer
     }
     for (const [key, mesh] of [...guestBombMeshes]) {
       if (live.has(key)) continue

@@ -79,6 +79,20 @@ export interface LeaveLobbyMessage {
   t: 'leave'
 }
 
+/**
+ * Reclaim a seat after the socket dropped.
+ *
+ * The server already holds a disconnected player's seat for RECONNECT_GRACE_MS
+ * so a blip does not end their match; this is how a returning client says which
+ * seat is theirs. Without it a reconnecting player could only ever arrive as a
+ * brand new participant, which is why any dropped socket used to be terminal.
+ */
+export interface ResumeLobbyMessage {
+  t: 'resume'
+  code: string
+  playerId: string
+}
+
 export interface SetReadyMessage {
   t: 'ready'
   ready: boolean
@@ -125,6 +139,7 @@ export type ClientMessage =
   | CreateLobbyMessage
   | JoinLobbyMessage
   | LeaveLobbyMessage
+  | ResumeLobbyMessage
   | SetReadyMessage
   | StartMatchMessage
   | InputMessage
@@ -257,6 +272,11 @@ export interface SnapshotPlayer {
 }
 
 export interface SnapshotBomb {
+  /**
+   * Stable identity. Without it a receiver cannot tell a bomb that moved from
+   * one that was destroyed and replaced, so kicked and thrown bombs teleported.
+   */
+  id: number
   x: number
   y: number
   /** Milliseconds left on the fuse, for the pulse animation. */

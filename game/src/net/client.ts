@@ -9,7 +9,10 @@ import {
   type ServerMessage,
 } from '../../shared/protocol'
 
-export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed'
+export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
+
+/** Backoff between reconnect attempts, in ms. Gives up after the last one. */
+const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000]
 
 export interface NetHandlers {
   onState?: (state: ConnectionState) => void
@@ -40,6 +43,20 @@ export class NetClient {
   private handlers: NetHandlers = {}
   private state: ConnectionState = 'idle'
   private pingTimer: ReturnType<typeof setInterval> | null = null
+
+  /**
+   * The seat to reclaim if the socket drops.
+   *
+   * A dropped socket used to end the session outright: `close` threw away the
+   * player id and the lobby and nothing ever tried again, even though the
+   * server holds the seat for half a minute. Remembering who we were is what
+   * makes recovery possible.
+   */
+  private resumeAs: { code: string; playerId: string } | null = null
+  /** Set by disconnect(), so a deliberate exit is never retried. */
+  private leaving = false
+  private reconnectAttempt = 0
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   /** Assigned by the server on join; null until then. */
   youId: string | null = null
@@ -77,7 +94,10 @@ export class NetClient {
     if (this.socket && (this.state === 'open' || this.state === 'connecting')) {
       return Promise.resolve()
     }
-    this.setState('connecting')
+    // Clear the deliberate-exit flag: a fresh connect means the player is
+    // starting again, and leaving it set would disable reconnect for good.
+    this.leaving = false
+    this.setState(this.resumeAs ? 'reconnecting' : 'connecting')
 
     return new Promise((resolve, reject) => {
       let socket: WebSocket
@@ -96,7 +116,13 @@ export class NetClient {
       }
 
       socket.addEventListener('open', () => {
+        this.reconnectAttempt = 0
         this.setState('open')
+        // Reclaim the seat before anything else, so gameplay traffic that
+        // arrives immediately after is attributed to the right player.
+        if (this.resumeAs) {
+          this.send({ t: 'resume', code: this.resumeAs.code, playerId: this.resumeAs.playerId })
+        }
         // Keeps intermediaries from dropping an idle socket and doubles as a
         // latency probe for the lobby UI.
         this.pingTimer = setInterval(() => {
@@ -110,9 +136,17 @@ export class NetClient {
       socket.addEventListener('close', () => {
         this.stopPing()
         this.socket = null
-        this.youId = null
-        this.lobby = null
-        this.setState('closed')
+
+        // Hold on to youId and the lobby while a reconnect is in flight: the
+        // seat is still ours for the server's grace period, and clearing them
+        // here is what made every blip terminal.
+        if (this.leaving || !this.resumeAs) {
+          this.youId = null
+          this.lobby = null
+          this.setState('closed')
+          return
+        }
+        this.scheduleReconnect()
       })
 
       socket.addEventListener('message', event => {
@@ -134,6 +168,8 @@ export class NetClient {
       case 'joined':
         this.youId = msg.youId
         this.lobby = msg.lobby
+        // Remember the seat so a dropped socket can be recovered.
+        this.resumeAs = { code: msg.lobby.code, playerId: msg.youId }
         this.handlers.onJoined?.(msg.youId, msg.lobby)
         break
       case 'lobby':
@@ -168,6 +204,39 @@ export class NetClient {
       clearInterval(this.pingTimer)
       this.pingTimer = null
     }
+  }
+
+  /**
+   * Try again after a growing delay, then give up.
+   *
+   * Bounded on purpose: past the server's grace period the seat is gone, so
+   * retrying forever would only keep a dead session on screen instead of
+   * telling the player to start a new one.
+   */
+  private scheduleReconnect(): void {
+    const delay = RECONNECT_DELAYS_MS[this.reconnectAttempt]
+    if (delay === undefined) {
+      this.resumeAs = null
+      this.youId = null
+      this.lobby = null
+      this.setState('closed')
+      return
+    }
+    this.reconnectAttempt++
+    this.setState('reconnecting')
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      if (this.leaving || !this.resumeAs) return
+      // connect() rejects on failure; the close handler queues the next try, so
+      // swallow it rather than leaving an unhandled rejection behind.
+      void this.connect().catch(() => {})
+    }, delay)
+  }
+
+  /** True while the socket is down but the seat may still be recoverable. */
+  isRecovering(): boolean {
+    return this.state === 'reconnecting'
   }
 
   send(message: ClientMessage): void {
@@ -207,9 +276,20 @@ export class NetClient {
   }
 
   disconnect(): void {
+    // Deliberate exit: forget the seat so the close handler does not try to
+    // reclaim something the player chose to leave.
+    this.leaving = true
+    this.resumeAs = null
+    this.reconnectAttempt = 0
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     this.stopPing()
     this.socket?.close()
     this.socket = null
+    this.youId = null
+    this.lobby = null
     this.setState('closed')
   }
 }
