@@ -184,9 +184,7 @@ module redis 'br/public:avm/res/cache/redis-enterprise:0.5.1' = {
       clusteringPolicy: 'NoCluster'
       // Lobbies must never be evicted under memory pressure — an evicted lobby
       // is indistinguishable to a joiner from a code that never existed, which
-      // is the exact failure this whole change exists to remove. This is the one
-      // property here that the working Yopass config does not set; if the
-      // deployment still fails, drop it next to isolate the cause.
+      // is the exact failure this whole change exists to remove.
       evictionPolicy: 'NoEviction'
       clientProtocol: 'Encrypted'
     }
