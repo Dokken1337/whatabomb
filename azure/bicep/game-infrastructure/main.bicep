@@ -2,7 +2,7 @@
 targetScope = 'subscription'
 
 // INIT
-param location string = 'swedencentral'
+param location string = 'westeurope'
 param prefix string = 'dokken'
 param tags object = {}
 
@@ -42,7 +42,7 @@ Azure Managed Redis SKU. Balanced_B0 is the smallest tier and is ample: the only
 thing stored is a handful of small lobby records, plus pub/sub traffic that is
 never retained.
 ''')
-param redisSkuName string // = 'Balanced_B0'
+param redisSkuName string = 'Balanced_B0'
 
 @description('Linux runtime stack for the Web App.')
 param linuxFxVersion string = 'NODE|22-lts'
@@ -61,7 +61,7 @@ var isFreeTier = appServicePlanSku == 'F1'
 var resourceGroupName = 'rg-${prefix}-${workload}'
 var appServicePlanName = 'asp-${prefix}-${workload}-${location}'
 var webAppName = 'app-${prefix}-${workload}'
-var redisName = 'redis-${prefix}-${workload}'
+var redisName = 'amr-${prefix}-${workload}'
 
 // Existing Resources
 var resourceGroupNetworkName = 'rg-${prefix}-network'
