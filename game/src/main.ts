@@ -50,7 +50,7 @@ import {
 import { generateMap, type SpawnPoint } from './map-gen'
 import { NetClient } from './net/client'
 import { createLobbyScreen } from './net/lobby-screen'
-import type { WorldSnapshot } from '../shared/protocol'
+import type { SnapshotPlayer, WorldSnapshot } from '../shared/protocol'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -211,7 +211,20 @@ interface NetPlayer {
   hasThrow: boolean
   speed: number
   moveDelay: number
-  lastMoveTime: number
+  /**
+   * Milliseconds banked toward the next step, capped at one step's worth while
+   * standing still.
+   *
+   * Deliberately not a "time of last move" stamp. Both sides gate a step on the
+   * same moveDelay, but each can only act on its own tick, so a stamp quietly
+   * rounds every wait up to the next tick and throws the remainder away —
+   * leaving the two ends stepping at slightly different rates and, worse,
+   * letting the host lose a step the guest has already predicted when a key is
+   * released mid-tick. Carrying the remainder makes the rate exact on both
+   * ends, so the host's sequence of steps is the guest's shifted by the network
+   * delay and nothing is ever dropped.
+   */
+  moveCredit: number
   lastDx: number
   lastDy: number
   invulnerable: boolean
@@ -2088,7 +2101,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         hasThrow: false,
         speed: 1,
         moveDelay: 150,
-        lastMoveTime: 0,
+        moveCredit: 150,
         lastDx: 0,
         lastDy: 1,
         invulnerable: false,
@@ -5252,13 +5265,55 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /** Fingerprint of the last HUD state a guest drew. See hudSignature. */
   let lastHudSignature = ''
   /**
-   * Sequence number of the newest input this guest has already acted on locally.
+   * Tiles this guest has predicted itself onto since the host last confirmed a
+   * position, oldest first.
    *
-   * Prediction and reconciliation hang off this: applySnapshot ignores the
-   * host's position for the local player until the host acknowledges at least
-   * this input, so a snapshot in flight cannot undo a move we have shown.
+   * This is what makes reconciliation possible without fighting the player. A
+   * guest that predicts its own movement is always ahead of the snapshot in
+   * flight by roughly the one-way latency, so its position and the host's
+   * legitimately disagree the entire time anyone is moving. Remembering the
+   * path is what lets the two be told apart: a host sitting on a tile we have
+   * already stood on is merely behind us, while a host somewhere else means we
+   * really did diverge.
    */
-  let lastPredictedSeq = -1
+  const predictedPath: Array<{ x: number; y: number; at: number }> = []
+  /**
+   * Round trip to the host, measured off our own inputs.
+   *
+   * Everything about reconciliation is a question of "how far behind is the
+   * host entitled to be", so it has to be measured rather than assumed. The
+   * keepalive ping only samples every twenty seconds; this rides the traffic
+   * already flowing — we know when we sent input N, and a snapshot acking N
+   * closes the loop.
+   */
+  let rttEstimate = 250
+  /** When each input went out, so an ack can be turned into a round trip. */
+  const inputSentAt = new Map<number, number>()
+  /** Wall clock of the last snapshot this guest applied. */
+  let lastSnapshotReceivedAt = 0
+  /**
+   * Stop predicting once the host has been quiet this long.
+   *
+   * The real hazard for prediction is not being a little ahead, it is running
+   * on nothing at all — a dropped connection, where a guest would otherwise
+   * happily walk the length of the arena into a world that stopped existing.
+   */
+  const PREDICT_BLIND_MS = 1000
+  /** Held direction as of the last frame, so a fresh press can act at once. */
+  let lastPredictedDirection = '0,0'
+
+  /**
+   * How many tiles prediction may run ahead of the last confirmed position.
+   *
+   * This has to scale with latency, not be a constant: the honest lead *is* a
+   * round trip's worth of steps, so a fixed cap that is comfortable on a LAN
+   * throttles a real connection — the guest stops early, the host keeps going,
+   * and the snapshot that catches up drags the player forwards instead. Which
+   * is the same jarring correction as a snap back, just in the other direction.
+   */
+  function maxPredictLead(np: NetPlayer): number {
+    return Math.max(4, Math.ceil(rttEstimate / np.moveDelay) + 2)
+  }
   /** Bomb meshes a guest is showing, keyed by the host's bomb id. */
   const guestBombMeshes = new Map<number, any>()
   /** `x,y` of every bomb in the last snapshot, so prediction can see them. */
@@ -5287,6 +5342,42 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   }
 
   /**
+   * Advance a networked player's movement clock by one tick and say whether a
+   * step is due.
+   *
+   * The host and every guest run this with the same numbers, which is the whole
+   * point: a guest predicts its own movement, so if the two ends step at even
+   * slightly different rates the gap between them grows until a correction has
+   * to yank the player somewhere. Banking the remainder rather than stamping
+   * the time of the last move is what makes the rates identical — a stamp
+   * rounds every wait up to whenever that end's tick happens to land and throws
+   * the leftover away.
+   *
+   * Standing still banks at most one step, so nobody can wait around storing up
+   * time and then cross three tiles at once.
+   */
+  function movementDue(np: NetPlayer, stepMs: number, holding: boolean): boolean {
+    np.moveCredit += stepMs
+    if (!holding) {
+      np.moveCredit = Math.min(np.moveCredit, np.moveDelay)
+      return false
+    }
+    return np.moveCredit >= np.moveDelay
+  }
+
+  /**
+   * Charge a player for the step they just took, or hold the clock at the ready
+   * if something was in the way.
+   *
+   * A refused step must not bank time — otherwise walking into a wall for a
+   * second and then turning away would spend that second crossing several tiles
+   * at once.
+   */
+  function settleMovement(np: NetPlayer, stepped: boolean): void {
+    np.moveCredit = stepped ? np.moveCredit - np.moveDelay : np.moveDelay
+  }
+
+  /**
    * Can this networked player step onto the tile?
    *
    * Ghost mode walks through crates and bombs, matching the offline rule.
@@ -5301,7 +5392,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   }
 
   /** Apply one player's current input. Host only. */
-  function stepNetPlayer(np: NetPlayer, now: number, stepMs: number): void {
+  function stepNetPlayer(np: NetPlayer, stepMs: number): void {
     if (!np.alive) return
     const { dx, dy, bomb } = np.input
 
@@ -5311,17 +5402,19 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       setCharacterVisibility(np.mesh, np.ghostTimer > 0 ? 0.5 : 1)
     }
 
-    if (dx !== 0 || dy !== 0) {
+    const holding = dx !== 0 || dy !== 0
+    const due = movementDue(np, stepMs, holding)
+    if (holding) {
       np.lastDx = dx
       np.lastDy = dy
       faceDirection(np.mesh, dx, dy)
-      if (now - np.lastMoveTime >= np.moveDelay) {
+      if (due) {
         const tx = np.x + dx
         const ty = np.y + dy
         if (netCanWalk(np, tx, ty)) {
           np.x = tx
           np.y = ty
-          np.lastMoveTime = now
+          settleMovement(np, true)
           collectNetPowerUps(np)
         } else if (np.hasKick && bombs.some(b => b.x === tx && b.y === ty)) {
           // Blocked by a bomb, and this player can kick — shove it along.
@@ -5329,7 +5422,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           // calling it for networked players, so kick was collectable online
           // but inert.
           kickBombFrom(np.x, np.y, dx, dy)
-          np.lastMoveTime = now
+          settleMovement(np, true)
+        } else {
+          settleMovement(np, false)
         }
       }
     }
@@ -5486,8 +5581,86 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return sig
   }
 
+  /**
+   * Fold the host's authoritative position into the one this guest predicted.
+   *
+   * The hard part is that "the two positions differ" is the normal state of
+   * affairs, not an error. A guest predicts its own movement the instant a key
+   * goes down; the host only learns about that key half a round trip later and
+   * its answer takes another half to come back. So while anyone is moving the
+   * snapshot on the wire always describes where they were, not where they are —
+   * on a 300ms link, two whole tiles back at base speed.
+   *
+   * Comparing the two positions and snapping on a mismatch therefore fought the
+   * player continuously: every snapshot dragged them back toward the past and
+   * the next frame walked them forward again. That is the rubber-banding.
+   *
+   * What actually separates "ahead" from "wrong" is whether the host's tile is
+   * one we have already stood on. If it is, the host is simply behind us on a
+   * path we chose and there is nothing to fix — it will catch up on its own. If
+   * it is not, we genuinely diverged (blocked by a bomb we could not see yet,
+   * kicked, killed) and have to be pulled onto it.
+   */
+  function reconcileLocal(np: NetPlayer, sp: SnapshotPlayer): void {
+    const now = Date.now()
+
+    // Close the loop on any input this snapshot acknowledges. Smoothed, because
+    // a single late frame should not move the lead cap around.
+    const sentAt = inputSentAt.get(sp.ackSeq)
+    if (sentAt !== undefined) {
+      rttEstimate = rttEstimate * 0.7 + (now - sentAt) * 0.3
+    }
+    for (const seq of [...inputSentAt.keys()]) {
+      if (seq <= sp.ackSeq) inputSentAt.delete(seq)
+    }
+
+    /** Adopt the host's position outright and start predicting afresh from it. */
+    const adopt = () => {
+      np.x = sp.x
+      np.y = sp.y
+      // Restart the move clock too, or the very next tick steps off the
+      // corrected tile and re-creates the disagreement we just resolved.
+      np.moveCredit = 0
+      predictedPath.length = 0
+    }
+
+    if (sp.x === np.x && sp.y === np.y) {
+      // The host has caught up. Nothing is outstanding.
+      predictedPath.length = 0
+      return
+    }
+
+    // Standing still, with the host having seen our newest input: it has made
+    // every move it is ever going to make on our behalf, so its position is
+    // final. Holding on to a predicted tile here is how you get killed by a
+    // blast on the square next door.
+    const held = readLocalMoveDirection()
+    if (held.dx === 0 && held.dy === 0 && sp.ackSeq >= localInputSeq) {
+      adopt()
+      return
+    }
+
+    // A tile only excuses the host while the host could still plausibly be on
+    // its way to it — about a round trip after we stepped there. Past that it is
+    // not lagging behind us, it is stuck: it refused a move we predicted, and
+    // holding the prediction would leave us walking around somewhere it has
+    // never put us.
+    const patience = Math.max(800, rttEstimate * 2)
+    const reached = predictedPath.findIndex(p => p.x === sp.x && p.y === sp.y)
+    if (reached >= 0 && now - predictedPath[reached].at < patience) {
+      // Behind us on our own path: let the prediction stand, and make the tile
+      // it reached the new origin so the steps it has already covered cannot
+      // excuse it a second time.
+      predictedPath.splice(0, reached)
+      return
+    }
+
+    adopt()
+  }
+
   /** Guests reconcile their world to the host's snapshot. */
   function applySnapshot(snapshot: WorldSnapshot): void {
+    lastSnapshotReceivedAt = Date.now()
     for (const sp of snapshot.players) {
       const np = netPlayerById(sp.id)
       if (!np) continue
@@ -5501,31 +5674,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         }
       }
       if (np.isLocal) {
-        // The local player predicts its own movement, so the host's position is
-        // only worth adopting once it has seen the input we predicted from — a
-        // snapshot built before our latest input would drag us back to where we
-        // were a round trip ago, which is the rubber-banding that made guests
-        // feel laggy in the first place.
-        //
-        // Even then, a single tile of disagreement along a held direction is
-        // just the two clocks being a tick apart and resolves itself. Only a
-        // larger gap means we genuinely diverged — blocked, kicked, or killed —
-        // and has to be corrected.
-        //
-        // Once the host has seen our *newest* input and we are no longer
-        // holding a direction, that reasoning runs out: nothing is in flight
-        // that could explain a difference, so the host is simply right. Letting
-        // a tile stand there left guests parked one square from where the host
-        // had them, which only ever surfaces as an explosion that kills you
-        // from the tile next door.
-        const acknowledged = sp.ackSeq >= lastPredictedSeq
-        const drift = Math.abs(sp.x - np.x) + Math.abs(sp.y - np.y)
-        const held = readLocalMoveDirection()
-        const settled = sp.ackSeq >= localInputSeq && held.dx === 0 && held.dy === 0
-        if (acknowledged && (drift > 1 || (settled && drift > 0))) {
-          np.x = sp.x
-          np.y = sp.y
-        }
+        reconcileLocal(np, sp)
       } else {
         np.x = sp.x
         np.y = sp.y
@@ -5814,7 +5963,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     if (local) local.input = { ...input, bomb: input.bomb || local.input.bomb }
 
     if (online.isHost) {
-      for (const np of netPlayers) stepNetPlayer(np, now, stepMs)
+      for (const np of netPlayers) stepNetPlayer(np, stepMs)
 
       // Invulnerability flicker is the host's call, mirrored via the snapshot.
       for (const np of netPlayers) {
@@ -5838,6 +5987,19 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         online.net.send({ t: 'state', tick: now, payload: buildSnapshot() })
       }
     } else {
+      // Sustained movement is predicted here, on the tick, rather than once per
+      // rendered frame.
+      //
+      // Both sides gate a step on the same moveDelay, but each rounds the wait
+      // up to its own next opportunity: the host to its 33ms tick, a guest
+      // rendering at 60Hz to a 16ms frame. That makes the guest a few percent
+      // faster — which does not sound like much until it compounds, a tile of
+      // unearned lead every ten seconds or so, and every tile of lead is one the
+      // host eventually takes back. Predicting on the same tick the host uses
+      // makes the two rates identical, so the gap between them stays at the
+      // latency and stops growing.
+      if (local && local.alive) predictLocalStep(local, input, stepMs)
+
       // Guests only publish input, and only when it actually changes, so a
       // still player costs nothing.
       const signature = `${input.dx},${input.dy},${input.bomb}`
@@ -5850,6 +6012,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           dy: input.dy,
           bomb: input.bomb,
         })
+        // Note when it went out so the ack can be turned into a round trip.
+        inputSentAt.set(localInputSeq, now)
+        if (inputSentAt.size > 64) inputSentAt.delete(inputSentAt.keys().next().value!)
       }
 
     }
@@ -5863,37 +6028,73 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * survive reconciliation, and a bomb that appears and then vanishes is worse
    * than one that appears a few frames late.
    */
-  function predictLocalStep(np: NetPlayer, input: { dx: number; dy: number }, now: number): void {
+  function predictLocalStep(np: NetPlayer, input: { dx: number; dy: number }, stepMs: number): void {
     const { dx, dy } = input
-    if (dx === 0 && dy === 0) return
+    const holding = dx !== 0 || dy !== 0
+    // Run the clock even when idle, so standing still caps the bank exactly as
+    // it does on the host.
+    const due = movementDue(np, stepMs, holding)
+    if (!holding) return
 
     np.lastDx = dx
     np.lastDy = dy
     faceDirection(np.mesh, dx, dy)
+    if (!due) return
 
-    if (now - np.lastMoveTime < np.moveDelay) return
+    const now = Date.now()
+    // The path runs from the last tile the host confirmed, so the first step of
+    // a run has to record where it set off from. Without that origin the very
+    // next snapshot — which still, correctly, shows us standing on it — matches
+    // nothing in the path and reads as a divergence, snapping us straight back
+    // to the tile we just left. That is the rubber-band, and it fires on every
+    // single step.
+    if (predictedPath.length === 0) predictedPath.push({ x: np.x, y: np.y, at: now })
+    // Never outrun the host by more than a round trip's worth of steps, and
+    // never predict at all once it has gone quiet. Past either line nothing we
+    // show has been confirmed by anyone, and each extra tile is one more the
+    // correction has to take back. Pausing reads as a brief hesitation; being
+    // yanked afterwards does not.
+    if (
+      predictedPath.length - 1 >= maxPredictLead(np) ||
+      now - lastSnapshotReceivedAt > PREDICT_BLIND_MS
+    ) {
+      settleMovement(np, false)
+      return
+    }
     const tx = np.x + dx
     const ty = np.y + dy
-    if (!netCanWalk(np, tx, ty)) return
+    if (!netCanWalk(np, tx, ty)) {
+      settleMovement(np, false)
+      return
+    }
 
     np.x = tx
     np.y = ty
-    np.lastMoveTime = now
-    lastPredictedSeq = localInputSeq
+    settleMovement(np, true)
+    predictedPath.push({ x: tx, y: ty, at: now })
   }
 
   /** Visual-only: smooth meshes toward their authoritative grid position. */
   function renderOnlineVisuals(deltaTime: number): void {
-    // Predict here rather than on the simulation tick.
+    // A direction that has just changed is predicted immediately, without
+    // waiting for the next tick.
     //
-    // The tick only runs every 33ms, so predicting there left a keypress
-    // waiting up to a full tick before anything moved — small, but enough to
-    // feel like the controls answer a frame late. Movement is still gated by
-    // the player's own moveDelay, so this only removes the tick quantisation.
+    // This is the one case where the tick's 33ms is felt: a fresh keypress that
+    // lands just after a tick would otherwise sit there before anything moved,
+    // which reads as the controls answering late. Holding a direction is left
+    // to the tick, where it steps at exactly the host's rate — see
+    // simulateOnlineTick.
     if (online && !online.isHost) {
       const me = localNetPlayer()
       if (me && me.alive && !isPaused && !gameOver) {
-        predictLocalStep(me, readLocalMoveDirection(), Date.now())
+        const held = readLocalMoveDirection()
+        const direction = `${held.dx},${held.dy}`
+        if (direction !== lastPredictedDirection) {
+          lastPredictedDirection = direction
+          // No time is banked here — this only spends what a fresh press has
+          // already earned by standing still. The tick owns the clock.
+          predictLocalStep(me, held, 0)
+        }
       }
     }
 
