@@ -5247,6 +5247,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         settleHeldDirection(np, msg.at)
 
         np.input = { dx: msg.dx, dy: msg.dy, bomb: msg.bomb || np.input.bomb }
+
+        beginHeldDirection(np)
       },
       onRelayState: msg => {
         // Guest only: adopt the host's world. The tick is the host's own clock;
@@ -5460,8 +5462,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     // One way, not the full round trip: we are correcting for how stale this
     // position is, not for when they will see the explosion.
     const oneWay = Math.min(np.rttMs / 2, BLAST_GRACE_MS)
+    // The ceiling is however far the grace window itself carries them, so it
+    // scales with Speed instead of quietly under-correcting the faster a player
+    // gets — which is the point at which the staleness hurts most.
     const steps = Math.min(
-      2,
+      Math.ceil(BLAST_GRACE_MS / np.moveDelay),
       Math.floor((np.moveCredit + oneWay) / np.moveDelay) -
         Math.floor(np.moveCredit / np.moveDelay),
     )
@@ -5534,6 +5539,40 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       settleMovement(np, true)
       collectNetPowerUps(np)
     }
+  }
+
+  /**
+   * Take the step a newly pressed direction has already earned. Host only.
+   *
+   * The mirror of what a guest does the instant a key goes down: if a full
+   * step's worth of time is banked, spend it now rather than on the next tick.
+   *
+   * Without this the two ends disagree about short taps. The guest steps at the
+   * press and is left with nothing banked; the host stepped a tick later and
+   * kept that tick's 33ms — so on a tap of much less than two steps the guest
+   * moved twice and the host once, and the difference had to be taken back.
+   * Long holds hid it, because both then average out to moveDelay.
+   */
+  function beginHeldDirection(np: NetPlayer): void {
+    if (!np.alive) return
+    const { dx, dy } = np.input
+    if (dx === 0 && dy === 0) return
+    if (np.moveCredit < np.moveDelay) return
+
+    np.lastDx = dx
+    np.lastDy = dy
+    faceDirection(np.mesh, dx, dy)
+
+    const tx = np.x + dx
+    const ty = np.y + dy
+    if (!netCanWalk(np, tx, ty)) {
+      settleMovement(np, false)
+      return
+    }
+    np.x = tx
+    np.y = ty
+    settleMovement(np, true)
+    collectNetPowerUps(np)
   }
 
   /** Apply one player's current input. Host only. */
@@ -5671,7 +5710,25 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return { dx, dy, bomb }
   }
 
+  /** What the last snapshot said, so the next tick can tell if anything moved. */
+  let lastSentWorld = ''
+
+  /** A cheap fingerprint of the things guests reconcile their prediction against. */
+  function worldFingerprint(): string {
+    let sig = ''
+    for (const p of netPlayers) sig += `${p.x},${p.y},${p.alive ? 1 : 0};`
+    sig += '|'
+    for (const b of bombs) sig += `${b.x},${b.y};`
+    return sig
+  }
+
+  /** Host only: has anything a guest predicts against moved since we last sent? */
+  function worldChangedSinceSnapshot(): boolean {
+    return worldFingerprint() !== lastSentWorld
+  }
+
   function buildSnapshot(): WorldSnapshot {
+    lastSentWorld = worldFingerprint()
     const snapshot: WorldSnapshot = {
       players: netPlayers.map(p => ({
         id: p.id,
@@ -6098,10 +6155,20 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * the match for everyone the moment the host alt-tabbed. A timer keeps
    * ticking (throttled, but alive) and recovers immediately on refocus.
    */
-  function simulateOnlineTick(): void {
+  function simulateOnlineTick(elapsedMs: number): void {
     if (!online || isPaused || gameOver) return
     const now = Date.now()
-    const stepMs = ONLINE_TICK_MS
+    // Real elapsed time, not the nominal tick length.
+    //
+    // A timer never fires exactly on its interval, so charging a flat 33ms per
+    // tick means each end grants movement time in its own lumps — and a lump is
+    // over half a step once Speed takes a tile down to 60ms. That is enough for
+    // the two ends to disagree about whether a quick tap moved one tile or two,
+    // every time, which no amount of reconciliation can smooth over because it
+    // is a real difference. Charging what actually elapsed makes both sides
+    // measure the same thing. Clamped so a stalled tab does not come back and
+    // teleport everyone across the arena.
+    const stepMs = Math.min(elapsedMs, 250)
 
     const local = localNetPlayer()
     const input = readLocalNetInput()
@@ -6126,7 +6193,15 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // carried by exactly one snapshot and are gone from the next. Waiting out
       // the interval delays every remote explosion by up to a frame's worth of
       // fuse, so send as soon as there is an event to carry.
-      const hasEvents = pendingBlasts.length > 0 || pendingCleared.length > 0
+      //
+      // A moved player or a new bomb goes out immediately too. Those are what
+      // guests reconcile against, and holding them for the interval is dead
+      // time added to every correction: a bomb a guest has not heard about yet
+      // is a tile it will happily predict itself onto and then be pulled off.
+      // The tick bounds this at ~30Hz, and an idle arena still costs the old
+      // 15Hz, so the extra traffic only appears while something is happening.
+      const hasEvents =
+        pendingBlasts.length > 0 || pendingCleared.length > 0 || worldChangedSinceSnapshot()
       if (hasEvents || now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS) {
         lastSnapshotAt = now
         online.net.send({ t: 'state', tick: now, payload: buildSnapshot() })
@@ -6145,30 +6220,47 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // latency and stops growing.
       if (local && local.alive) predictLocalStep(local, input, stepMs)
 
-      // Guests only publish input, and only when it actually changes, so a
-      // still player costs nothing.
-      const signature = `${input.dx},${input.dy},${input.bomb}`
-      if (signature !== lastSentInput || input.bomb) {
-        lastSentInput = signature
-        online.net.send({
-          t: 'input',
-          seq: ++localInputSeq,
-          dx: input.dx,
-          dy: input.dy,
-          bomb: input.bomb,
-          // performance.now(), not Date.now(): it is monotonic and immune to
-          // the system clock being corrected under us mid-match. The host only
-          // ever subtracts two of these from each other, never compares them to
-          // its own clock.
-          at: Math.round(performance.now()),
-          ackTick: lastAppliedTick,
-        })
-        // Note when it went out so the ack can be turned into a round trip.
-        inputSentAt.set(localInputSeq, now)
-        if (inputSentAt.size > 64) inputSentAt.delete(inputSentAt.keys().next().value!)
-      }
-
+      // Safety net only — the frame loop normally publishes the moment a key
+      // changes, which is the whole point. This catches the case where frames
+      // have stalled but the tick is still running.
+      publishLocalInput(input)
     }
+  }
+
+  /**
+   * Send the local player's input, if it has changed since the last one.
+   *
+   * Called from the render loop rather than only from the tick. Waiting for the
+   * tick added up to 33ms between a key changing and the host hearing about it,
+   * on top of the network delay — and unlike the network delay, that part is
+   * pure divergence: this client has already predicted the turn, the host has
+   * not. At base speed 33ms is a fifth of a tile and hides in the noise. With
+   * two Speed pickups a tile takes 90ms, so the same 33ms is a third of a tile
+   * every time you change direction, which is exactly when threading a gap
+   * needs the two ends to agree.
+   */
+  function publishLocalInput(input: { dx: number; dy: number; bomb: boolean }): void {
+    if (!online || online.isHost) return
+    // Guests only publish when it actually changes, so a still player costs
+    // nothing. Bombs are edge-triggered and always go.
+    const signature = `${input.dx},${input.dy},${input.bomb}`
+    if (signature === lastSentInput && !input.bomb) return
+    lastSentInput = signature
+    online.net.send({
+      t: 'input',
+      seq: ++localInputSeq,
+      dx: input.dx,
+      dy: input.dy,
+      bomb: input.bomb,
+      // performance.now(), not Date.now(): it is monotonic and immune to the
+      // system clock being corrected under us mid-match. The host only ever
+      // subtracts two of these from each other, never compares them to its own.
+      at: Math.round(performance.now()),
+      ackTick: lastAppliedTick,
+    })
+    // Note when it went out so the ack can be turned into a round trip.
+    inputSentAt.set(localInputSeq, Date.now())
+    if (inputSentAt.size > 64) inputSentAt.delete(inputSentAt.keys().next().value!)
   }
 
   /**
@@ -6235,18 +6327,20 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     // which reads as the controls answering late. Holding a direction is left
     // to the tick, where it steps at exactly the host's rate — see
     // simulateOnlineTick.
-    if (online && !online.isHost) {
+    if (online && !online.isHost && !isPaused && !gameOver) {
       const me = localNetPlayer()
-      if (me && me.alive && !isPaused && !gameOver) {
-        const held = readLocalMoveDirection()
-        const direction = `${held.dx},${held.dy}`
-        if (direction !== lastPredictedDirection) {
-          lastPredictedDirection = direction
-          // No time is banked here — this only spends what a fresh press has
-          // already earned by standing still. The tick owns the clock.
-          predictLocalStep(me, held, 0)
-        }
+      const held = readLocalMoveDirection()
+      const direction = `${held.dx},${held.dy}`
+      if (direction !== lastPredictedDirection) {
+        lastPredictedDirection = direction
+        // No time is banked here — this only spends what a fresh press has
+        // already earned by standing still. The tick owns the clock.
+        if (me && me.alive) predictLocalStep(me, held, 0)
       }
+      // Publish every frame, not just on a turn: this also carries a bomb press
+      // out at once instead of holding it for the tick. The send itself is a
+      // no-op unless something changed.
+      publishLocalInput(readLocalNetInput())
     }
 
     const lerp = Math.min(1, MOVE_LERP_SPEED * deltaTime / 1000)
@@ -6285,7 +6379,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // A throw here must not take the match down with it: an uncaught error
       // inside the loop is exactly what silently froze clients before.
       try {
-        simulateOnlineTick()
+        simulateOnlineTick(elapsed)
         if (online.isHost && !isPaused && !gameOver) {
           updateBombs(Math.min(elapsed, 250))
         }
