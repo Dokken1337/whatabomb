@@ -509,6 +509,11 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         dx: Math.sign(Number(message.dx) || 0),
         dy: Math.sign(Number(message.dy) || 0),
         bomb: Boolean(message.bomb),
+        // Timing the host needs, passed through untouched. Both are read only
+        // against a clock the reader already owns, so the relay has no business
+        // rewriting them — see InputMessage.
+        at: Number(message.at) || 0,
+        ackTick: Number(message.ackTick) || 0,
       })
       return
     }

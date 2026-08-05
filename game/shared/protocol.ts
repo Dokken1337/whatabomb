@@ -113,6 +113,29 @@ export interface InputMessage {
   dx: number
   dy: number
   bomb: boolean
+  /**
+   * The sender's own monotonic clock when this input was raised.
+   *
+   * Only ever read as a difference against the *same sender's* previous input,
+   * which is how long they held the last direction. That is the one thing
+   * arrival times cannot tell the host: network jitter stretches and squeezes
+   * the gap between two messages, so timing movement by when they turned up
+   * silently gave players a step more or less than they earned.
+   *
+   * Because it is only ever differenced against itself, it does not matter what
+   * this clock is set to — two players on opposite sides of the world, with
+   * wrong clocks and different time zones, still each report their own hold
+   * durations correctly. Never compare it to the receiver's clock.
+   */
+  at: number
+  /**
+   * `tick` of the most recent snapshot this client applied.
+   *
+   * The host stamps every snapshot with its own clock and gets this back, so
+   * subtracting gives the round trip measured entirely in host time — again
+   * without either end needing to agree with the other about what time it is.
+   */
+  ackTick: number
 }
 
 /** Host only. A snapshot of the authoritative world, fanned out to guests. */
@@ -192,6 +215,10 @@ export interface RelayInputMessage {
   dx: number
   dy: number
   bomb: boolean
+  /** Sender's own clock — see InputMessage.at. */
+  at: number
+  /** Last snapshot tick the sender applied — see InputMessage.ackTick. */
+  ackTick: number
 }
 
 /** A host snapshot forwarded to guests. */

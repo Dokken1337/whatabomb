@@ -225,6 +225,17 @@ interface NetPlayer {
    * delay and nothing is ever dropped.
    */
   moveCredit: number
+  /**
+   * `at` from this player's last input, on their own clock. Host only.
+   *
+   * Differenced against the next one to learn how long a direction was really
+   * held, instead of inferring it from arrival times that jitter distorts.
+   */
+  lastInputAt: number | null
+  /** Movement time the host has banked from ticks since that input. Host only. */
+  creditedSinceInput: number
+  /** Round trip to this player, measured in host time. Host only. */
+  rttMs: number
   lastDx: number
   lastDy: number
   invulnerable: boolean
@@ -2102,6 +2113,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         speed: 1,
         moveDelay: 150,
         moveCredit: 150,
+        lastInputAt: null,
+        creditedSinceInput: 0,
+        rttMs: 0,
         lastDx: 0,
         lastDy: 1,
         invulnerable: false,
@@ -3540,6 +3554,10 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         for (const np of netPlayers) {
           if (!np.alive || np.invulnerable) continue
           if (np.x !== x || np.y !== y) continue
+          // They are standing here as far as this machine knows — but that
+          // knowledge is a network delay old. If they have already carried
+          // themselves out of the blast, do not kill them for the delay.
+          if (!blastStillCatches(np, explosionTiles)) continue
 
           // Shield soaks the hit instead of a life, as it does offline. Without
           // this a networked shield was collected and then never consulted.
@@ -5210,10 +5228,31 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         const np = netPlayerById(msg.playerId)
         if (!np || msg.seq <= np.inputSeq) return
         np.inputSeq = msg.seq
+
+        // Round trip, measured entirely in this machine's own clock: we stamped
+        // the snapshot, they echoed the stamp back. Nothing here depends on the
+        // two computers agreeing about what time it is.
+        if (msg.ackTick > 0) {
+          const sample = Math.max(0, Date.now() - msg.ackTick)
+          np.rttMs = np.rttMs === 0 ? sample : np.rttMs * 0.7 + sample * 0.3
+        }
+
+        // Settle the direction they are leaving before adopting the new one.
+        //
+        // They held it for `at - lastInputAt` by their own clock; the ticks here
+        // have granted `creditedSinceInput`. Those differ because the two
+        // messages did not spend the same time on the wire — which is exactly
+        // the jitter that used to cost a player a step whenever they let go of a
+        // key at the wrong moment. Trust their clock over our arrival times.
+        settleHeldDirection(np, msg.at)
+
         np.input = { dx: msg.dx, dy: msg.dy, bomb: msg.bomb || np.input.bomb }
       },
       onRelayState: msg => {
-        // Guest only: adopt the host's world.
+        // Guest only: adopt the host's world. The tick is the host's own clock;
+        // hold it so our next input can hand it straight back and let the host
+        // time the round trip without either of us reading the other's clock.
+        lastAppliedTick = msg.tick
         applySnapshot(msg.payload as WorldSnapshot)
       },
     })
@@ -5291,6 +5330,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   const inputSentAt = new Map<number, number>()
   /** Wall clock of the last snapshot this guest applied. */
   let lastSnapshotReceivedAt = 0
+  /** `tick` of that snapshot — the host's clock, echoed back with our input. */
+  let lastAppliedTick = 0
   /**
    * Stop predicting once the host has been quiet this long.
    *
@@ -5362,6 +5403,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       np.moveCredit = Math.min(np.moveCredit, np.moveDelay)
       return false
     }
+    // Remember what the ticks have granted, so the next input can true it up
+    // against how long the player actually held this direction.
+    np.creditedSinceInput += stepMs
     return np.moveCredit >= np.moveDelay
   }
 
@@ -5389,6 +5433,107 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     if (grid[ty][tx] === 'destructible' && !ghosting) return false
     if (!ghosting && bombOnTile(tx, ty)) return false
     return !netPlayers.some(other => other !== np && other.alive && other.x === tx && other.y === ty)
+  }
+
+  /** Ceiling on how far a blast may be rewound for a laggy player, in ms. */
+  const BLAST_GRACE_MS = 150
+
+  /**
+   * Where a networked player has really got to by now. Host only.
+   *
+   * The host's copy of a remote player is always one network delay behind:
+   * their input takes that long to arrive, so the simulation here is always
+   * replaying a moment that, on their screen, has already passed. At 300ms
+   * round trip that is a whole tile — which is why players report running clear
+   * of a blast and dying anyway. They did run clear. The host was looking at
+   * where they used to be.
+   *
+   * Projecting them forward by the measured delay corrects that known error. It
+   * is deliberately not a favour: the local player, whose position is exact,
+   * projects nowhere, and the projection is capped so a bad connection cannot
+   * turn into invulnerability.
+   */
+  function projectNetPlayer(np: NetPlayer): { x: number; y: number } {
+    const { dx, dy } = np.input
+    if (np.isLocal || (dx === 0 && dy === 0)) return { x: np.x, y: np.y }
+
+    // One way, not the full round trip: we are correcting for how stale this
+    // position is, not for when they will see the explosion.
+    const oneWay = Math.min(np.rttMs / 2, BLAST_GRACE_MS)
+    const steps = Math.min(
+      2,
+      Math.floor((np.moveCredit + oneWay) / np.moveDelay) -
+        Math.floor(np.moveCredit / np.moveDelay),
+    )
+
+    let x = np.x
+    let y = np.y
+    for (let i = 0; i < steps; i++) {
+      if (!netCanWalk(np, x + dx, y + dy)) break
+      x += dx
+      y += dy
+    }
+    return { x, y }
+  }
+
+  /** Is this player still caught by the blast once the delay is accounted for? */
+  function blastStillCatches(np: NetPlayer, tiles: Array<[number, number]>): boolean {
+    const to = projectNetPlayer(np)
+    if (to.x === np.x && to.y === np.y) return true
+    return tiles.some(([tx, ty]) => tx === to.x && ty === to.y)
+  }
+
+  /**
+   * Pay a player for the direction they are letting go of, then reset the
+   * bookkeeping for the next one. Host only.
+   *
+   * `at` is the sender's clock. The difference between two of their own stamps
+   * is the true length of the hold; anything the ticks over- or under-granted in
+   * the meantime is corrected here, and any whole step that buys is taken in the
+   * direction they were still holding — before the new input replaces it.
+   *
+   * Clamped, because this is the one number a client controls that buys
+   * movement. A gap longer than a second cannot be honest input anyway, and no
+   * single input may buy more than a couple of tiles.
+   */
+  function settleHeldDirection(np: NetPlayer, at: number): void {
+    const previous = np.lastInputAt
+    const credited = np.creditedSinceInput
+    np.creditedSinceInput = 0
+
+    // A stamp we cannot trust buys nothing. Anything else lets a missing or
+    // garbage value reach the arithmetic below, and one NaN in moveCredit is
+    // permanent: every later comparison against it is false, so that player
+    // never takes another step for the rest of the match. A client too old to
+    // send this, or a relay that drops it, has to degrade to the tick-only
+    // timing rather than freeze.
+    if (!Number.isFinite(at) || at <= 0) return
+    np.lastInputAt = at
+
+    // Only a direction that was actually held is owed anything. The gap since a
+    // release is time spent standing still, and paying for it would hand the
+    // player a couple of free tiles the moment they pressed a key again.
+    const { dx, dy } = np.input
+    if (previous === null || (dx === 0 && dy === 0)) {
+      np.moveCredit = Math.min(np.moveCredit, np.moveDelay)
+      return
+    }
+
+    const owed = Math.min(Math.max(at - previous, 0), 1000)
+    np.moveCredit += owed - credited
+
+    for (let taken = 0; taken < 2 && np.moveCredit >= np.moveDelay; taken++) {
+      const tx = np.x + dx
+      const ty = np.y + dy
+      if (!netCanWalk(np, tx, ty)) {
+        settleMovement(np, false)
+        return
+      }
+      np.x = tx
+      np.y = ty
+      settleMovement(np, true)
+      collectNetPowerUps(np)
+    }
   }
 
   /** Apply one player's current input. Host only. */
@@ -6011,6 +6156,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           dx: input.dx,
           dy: input.dy,
           bomb: input.bomb,
+          // performance.now(), not Date.now(): it is monotonic and immune to
+          // the system clock being corrected under us mid-match. The host only
+          // ever subtracts two of these from each other, never compares them to
+          // its own clock.
+          at: Math.round(performance.now()),
+          ackTick: lastAppliedTick,
         })
         // Note when it went out so the ack can be turned into a round trip.
         inputSentAt.set(localInputSeq, now)
