@@ -201,6 +201,17 @@ interface NetPlayer {
   y: number
   visualX: number
   visualZ: number
+  /**
+   * Tiles the model still has to walk through to reach `x`/`y`.
+   *
+   * Movement on a grid is always one orthogonal step at a time; queueing the
+   * steps is what keeps the model on the grid when two of them arrive in the
+   * same snapshot. See advanceNetVisual.
+   */
+  visualPath: Array<{ x: number; y: number }>
+  /** Tile at the end of that queue — what the model has been told about. */
+  queuedX: number
+  queuedY: number
   mesh: any
   lives: number
   alive: boolean
@@ -2102,6 +2113,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         y: spawn.y,
         visualX: world.x,
         visualZ: world.z,
+        visualPath: [],
+        queuedX: spawn.x,
+        queuedY: spawn.y,
         mesh,
         lives: online.lives,
         alive: true,
@@ -5440,6 +5454,80 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /** Ceiling on how far a blast may be rewound for a laggy player, in ms. */
   const BLAST_GRACE_MS = 150
 
+  /** Beyond this many tiles behind, the visual stops walking and just arrives. */
+  const MAX_VISUAL_CATCHUP = 3
+
+  /**
+   * Walk a networked character's model along the grid toward where it actually
+   * is, one tile at a time.
+   *
+   * This used to be a straight lerp of each axis toward the current tile, which
+   * is fine only while the model is never more than one step behind. It is not:
+   * a snapshot can carry two steps at once, and a player rounding a corner then
+   * arrives as a change on *both* axes. Interpolating them together cuts the
+   * corner — the character slides diagonally across a wall it never walked
+   * through. That reads as "moving diagonally", and because the slide takes
+   * longer than a step it also reads as lag.
+   *
+   * Queueing the tiles instead keeps every movement orthogonal, at the player's
+   * real speed. A model that has fallen behind hurries rather than drifting;
+   * one that is further behind than any walk could explain has been corrected,
+   * not moved, so it is placed rather than animated.
+   */
+  function advanceNetVisual(np: NetPlayer, deltaTime: number): void {
+    // Fold any new authoritative tiles into the walk queue.
+    if (np.x !== np.queuedX || np.y !== np.queuedY) {
+      const gap = Math.abs(np.x - np.queuedX) + Math.abs(np.y - np.queuedY)
+      if (gap > MAX_VISUAL_CATCHUP) {
+        np.visualPath.length = 0
+        gridToWorldInPlace(np.x, np.y, _tmpGridVec)
+        np.visualX = _tmpGridVec.x
+        np.visualZ = _tmpGridVec.z
+      } else {
+        // Rebuild an orthogonal route. The true one is unknown when two steps
+        // arrive together, but any grid-following route beats a diagonal.
+        let cx = np.queuedX
+        let cy = np.queuedY
+        while (cx !== np.x) {
+          cx += Math.sign(np.x - cx)
+          np.visualPath.push({ x: cx, y: cy })
+        }
+        while (cy !== np.y) {
+          cy += Math.sign(np.y - cy)
+          np.visualPath.push({ x: cx, y: cy })
+        }
+      }
+      np.queuedX = np.x
+      np.queuedY = np.y
+    }
+
+    if (np.visualPath.length === 0) return
+
+    // One tile per moveDelay, plus a nudge when there is a backlog to clear.
+    let budget = (TILE_SIZE / Math.max(1, np.moveDelay)) * deltaTime
+    if (np.visualPath.length > 1) budget *= 1 + (np.visualPath.length - 1) * 0.6
+
+    while (budget > 0 && np.visualPath.length > 0) {
+      const next = np.visualPath[0]
+      gridToWorldInPlace(next.x, next.y, _tmpGridVec)
+      const dx = _tmpGridVec.x - np.visualX
+      const dz = _tmpGridVec.z - np.visualZ
+      // Each hop is one orthogonal tile, so one of these is always zero.
+      const remaining = Math.abs(dx) + Math.abs(dz)
+      if (remaining <= budget || remaining < 1e-4) {
+        np.visualX = _tmpGridVec.x
+        np.visualZ = _tmpGridVec.z
+        budget -= remaining
+        np.visualPath.shift()
+      } else {
+        const t = budget / remaining
+        np.visualX += dx * t
+        np.visualZ += dz * t
+        budget = 0
+      }
+    }
+  }
+
   /**
    * Where a networked player has really got to by now. Host only.
    *
@@ -6343,11 +6431,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       publishLocalInput(readLocalNetInput())
     }
 
-    const lerp = Math.min(1, MOVE_LERP_SPEED * deltaTime / 1000)
     for (const np of netPlayers) {
-      gridToWorldInPlace(np.x, np.y, _tmpGridVec)
-      np.visualX += (_tmpGridVec.x - np.visualX) * lerp
-      np.visualZ += (_tmpGridVec.z - np.visualZ) * lerp
+      advanceNetVisual(np, deltaTime)
       np.mesh.position.x = np.visualX
       np.mesh.position.z = np.visualZ
     }
