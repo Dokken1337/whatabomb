@@ -313,6 +313,23 @@ export interface SnapshotPlayer {
    * predates their latest input does not yank them backwards.
    */
   ackSeq: number
+  /**
+   * The player's banked movement time on the host.
+   *
+   * Replay has to start from the same clock as well as the same tile, or it
+   * re-derives a position from a different amount of change owed.
+   */
+  credit: number
+  /**
+   * The moment, on *this player's own clock*, the host has simulated them
+   * through.
+   *
+   * The host learns it from their input stamps and hands it straight back, so
+   * the player can replay exactly the span the host has not covered yet. Like
+   * `at`, it never crosses a clock boundary: it is the player's own number
+   * coming home.
+   */
+  simAt: number
 }
 
 export interface SnapshotBomb {
