@@ -53,11 +53,15 @@ import { createLobbyScreen } from './net/lobby-screen'
 import type { SnapshotPlayer, WorldSnapshot } from '../shared/protocol'
 import {
   accrue,
+  appendWaypoints,
   isDue,
   moveDelayForSpeed,
+  pruneWaypoints,
   replay,
+  sampleAt,
   settle,
   type TimedInput,
+  type Waypoint,
 } from '../shared/movement'
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -213,9 +217,17 @@ interface NetPlayer {
    * Which world axis the model is mid-step along, if any.
    *
    * Walking a grid means finishing one axis before starting the other; this is
-   * what remembers which. See advanceNetVisual.
+   * what remembers which. Only used for the local player, whose position is
+   * predicted and so must be drawn the moment it changes.
    */
   visualAxis: 'x' | 'z' | null
+  /**
+   * Reported positions for a player this client does not predict.
+   *
+   * Drawn a fixed moment behind the newest of them, so there is always a known
+   * position either side of what is on screen. See shared/movement.ts.
+   */
+  visualBuffer: Waypoint[]
   mesh: any
   lives: number
   alive: boolean
@@ -2118,6 +2130,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         visualX: world.x,
         visualZ: world.z,
         visualAxis: null,
+        visualBuffer: [],
         mesh,
         lives: online.lives,
         alive: true,
@@ -5441,6 +5454,31 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   const MAX_VISUAL_CATCHUP = 3
   /** Hardest a trailing model may hurry. Enough to close a gap, not to sprint. */
   const MAX_VISUAL_HURRY = 1.6
+  /**
+   * How far behind the newest report other players are drawn.
+   *
+   * Buys a known position on either side of whatever moment is on screen, which
+   * is what makes their movement an interpolation instead of a pursuit. Wide
+   * enough to swallow a couple of snapshot intervals of jitter; every millisecond
+   * beyond that is just added delay, so it is not generous for its own sake.
+   */
+  const INTERP_DELAY_MS = 100
+
+  /**
+   * Draw a player this client does not predict, a fixed moment in the past.
+   *
+   * They were always being shown in the past — that is what a network is. This
+   * only makes the delay steady rather than varying with whenever the last
+   * report happened to land, and it is the variation that reads as stutter.
+   */
+  function drawReportedPlayer(np: NetPlayer, drawAt: number): void {
+    pruneWaypoints(np.visualBuffer, drawAt)
+    const seen = sampleAt(np.visualBuffer, drawAt)
+    if (!seen) return
+    gridToWorldInPlace(seen.x, seen.y, _tmpGridVec)
+    np.visualX = _tmpGridVec.x
+    np.visualZ = _tmpGridVec.z
+  }
 
   /**
    * Move a networked character's model toward where that player actually is,
@@ -5942,6 +5980,21 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       } else {
         np.x = sp.x
         np.y = sp.y
+        // Record it for drawing. Stamped on arrival: the buffer's whole job is
+        // to absorb the unevenness of when these turn up, so the stamp that
+        // matters is when we learned, not when the host said it.
+        const arrivedAt = Date.now()
+        appendWaypoints(
+          np.visualBuffer,
+          sp.x,
+          sp.y,
+          arrivedAt,
+          MAX_VISUAL_CATCHUP,
+          np.moveDelay,
+          // Never behind what is already on screen, or a refill after a stall
+          // is drawn as an arrival rather than a walk.
+          arrivedAt - INTERP_DELAY_MS,
+        )
       }
 
       np.lives = sp.lives
@@ -6400,8 +6453,15 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       publishLocalInput(readLocalNetInput())
     }
 
+    // Two different jobs, deliberately. Our own character is predicted, so its
+    // position is already the present and has to be drawn immediately or the
+    // controls feel dead. Everybody else is only ever known from reports, so
+    // they are drawn a fixed moment behind the newest one — always between two
+    // known positions rather than chasing the latest.
+    const drawAt = Date.now() - INTERP_DELAY_MS
     for (const np of netPlayers) {
-      advanceNetVisual(np, deltaTime)
+      if (np.isLocal) advanceNetVisual(np, deltaTime)
+      else drawReportedPlayer(np, drawAt)
       np.mesh.position.x = np.visualX
       np.mesh.position.z = np.visualZ
     }

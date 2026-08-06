@@ -192,3 +192,121 @@ export function inputAt(inputs: TimedInput[], at: number): TimedInput | null {
   }
   return found
 }
+
+// ── Drawing somebody else ────────────────────────────────────────────────────
+//
+// A player you are not predicting can only be drawn from what the authority
+// reported, which arrives in lumps and at uneven spacing. Chasing the newest
+// report means the model is permanently trying to reach somewhere it never
+// quite gets to, and has to be allowed to hurry — which looks like the
+// character is faster than they are.
+//
+// Buffering the reports and drawing a fixed moment *behind* the newest one
+// removes the chase entirely: there are always two known positions either side
+// of the moment being drawn, so it is an interpolation rather than a pursuit.
+// The cost is that other players are shown slightly in the past, which they
+// already were — this only makes the delay steady instead of varying, and it is
+// the variation that reads as stutter.
+
+/** One reported position, stamped when it was received. */
+export interface Waypoint {
+  x: number
+  y: number
+  at: number
+}
+
+/**
+ * Record where a player has been reported, as steps that can be walked.
+ *
+ * A report can carry more than one tile of movement, and one that crosses a
+ * corner moves on both axes at once. Interpolating straight to it would cut
+ * that corner — the character slides diagonally through a wall. Splitting the
+ * move into single orthogonal steps, sharing the time it took, keeps every
+ * segment on the grid.
+ *
+ * A jump too large to be walking is a correction, not movement. Animating those
+ * only makes it look like the character chose to go, so the trail is dropped and
+ * the new position stands alone.
+ */
+export function appendWaypoints(
+  buffer: Waypoint[],
+  x: number,
+  y: number,
+  at: number,
+  maxWalkableJump: number,
+  minStepMs: number,
+  notBefore: number,
+): void {
+  const last = buffer[buffer.length - 1]
+  if (!last) {
+    buffer.push({ x, y, at })
+    return
+  }
+  const gap = Math.abs(x - last.x) + Math.abs(y - last.y)
+  if (gap === 0) return
+  if (gap > maxWalkableJump) {
+    buffer.length = 0
+    buffer.push({ x, y, at })
+    return
+  }
+
+  // Never schedule a step into a moment already drawn.
+  //
+  // After a stall the trail's last stamp is stale, and hanging the new steps
+  // off it puts every one of them in the past — so playback does not walk
+  // them, it arrives at the end of them, which is the character flickering
+  // across the board. Restarting from the moment being drawn is what keeps a
+  // refill a walk.
+  const base = Math.max(last.at, notBefore)
+
+  // Share the time across the steps it must have taken — but never less than
+  // the steps could physically have taken. Several reports can land in the same
+  // instant, and timing the walk by when we heard about it would cram a second
+  // of travel into a millisecond. How long those steps really took is not a
+  // guess: a player cannot cross a tile faster than their own move delay.
+  const span = Math.max(1, at - base, gap * minStepMs)
+  let cx = last.x
+  let cy = last.y
+  let taken = 0
+  while (cx !== x) {
+    cx += Math.sign(x - cx)
+    taken++
+    buffer.push({ x: cx, y: cy, at: base + (span * taken) / gap })
+  }
+  while (cy !== y) {
+    cy += Math.sign(y - cy)
+    taken++
+    buffer.push({ x: cx, y: cy, at: base + (span * taken) / gap })
+  }
+}
+
+/**
+ * Where a player was at a given moment, between the positions either side of it.
+ *
+ * Deliberately never extrapolates. Running past the newest report and guessing
+ * where somebody is heading is what produces movement with nobody driving it —
+ * a character that keeps walking after its player stopped. Out of reports, it
+ * holds still until more arrive, which is honest: we do not know.
+ */
+export function sampleAt(buffer: Waypoint[], at: number): { x: number; y: number } | null {
+  if (buffer.length === 0) return null
+  const first = buffer[0]
+  if (at <= first.at) return { x: first.x, y: first.y }
+
+  for (let i = 0; i < buffer.length - 1; i++) {
+    const a = buffer[i]
+    const b = buffer[i + 1]
+    if (at >= b.at) continue
+    const span = b.at - a.at
+    const t = span > 0 ? (at - a.at) / span : 1
+    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
+  }
+
+  const last = buffer[buffer.length - 1]
+  return { x: last.x, y: last.y }
+}
+
+/** Drop waypoints already behind the moment being drawn, keeping one for the lerp. */
+export function pruneWaypoints(buffer: Waypoint[], at: number): void {
+  while (buffer.length > 2 && buffer[1].at <= at) buffer.shift()
+}
