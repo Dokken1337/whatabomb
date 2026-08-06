@@ -202,16 +202,12 @@ interface NetPlayer {
   visualX: number
   visualZ: number
   /**
-   * Tiles the model still has to walk through to reach `x`/`y`.
+   * Which world axis the model is mid-step along, if any.
    *
-   * Movement on a grid is always one orthogonal step at a time; queueing the
-   * steps is what keeps the model on the grid when two of them arrive in the
-   * same snapshot. See advanceNetVisual.
+   * Walking a grid means finishing one axis before starting the other; this is
+   * what remembers which. See advanceNetVisual.
    */
-  visualPath: Array<{ x: number; y: number }>
-  /** Tile at the end of that queue — what the model has been told about. */
-  queuedX: number
-  queuedY: number
+  visualAxis: 'x' | 'z' | null
   mesh: any
   lives: number
   alive: boolean
@@ -2113,9 +2109,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         y: spawn.y,
         visualX: world.x,
         visualZ: world.z,
-        visualPath: [],
-        queuedX: spawn.x,
-        queuedY: spawn.y,
+        visualAxis: null,
         mesh,
         lives: online.lives,
         alive: true,
@@ -5454,77 +5448,86 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /** Ceiling on how far a blast may be rewound for a laggy player, in ms. */
   const BLAST_GRACE_MS = 150
 
-  /** Beyond this many tiles behind, the visual stops walking and just arrives. */
+  /** Beyond this many tiles behind, the model is placed rather than walked. */
   const MAX_VISUAL_CATCHUP = 3
+  /** Hardest a trailing model may hurry. Enough to close a gap, not to sprint. */
+  const MAX_VISUAL_HURRY = 1.6
 
   /**
-   * Walk a networked character's model along the grid toward where it actually
-   * is, one tile at a time.
+   * Move a networked character's model toward where that player actually is,
+   * along the grid rather than straight there.
    *
-   * This used to be a straight lerp of each axis toward the current tile, which
-   * is fine only while the model is never more than one step behind. It is not:
-   * a snapshot can carry two steps at once, and a player rounding a corner then
-   * arrives as a change on *both* axes. Interpolating them together cuts the
-   * corner — the character slides diagonally across a wall it never walked
-   * through. That reads as "moving diagonally", and because the slide takes
-   * longer than a step it also reads as lag.
+   * The original was a lerp of each axis toward the current tile, which is only
+   * right while the model is never more than one step behind. It is not: a
+   * snapshot can carry two steps, and a player rounding a corner then arrives as
+   * a change on *both* axes. Interpolating those together cuts the corner — the
+   * character slides diagonally through a wall it never walked past, and the
+   * slide takes longer than a step, so it reads as lag too.
    *
-   * Queueing the tiles instead keeps every movement orthogonal, at the player's
-   * real speed. A model that has fallen behind hurries rather than drifting;
-   * one that is further behind than any walk could explain has been corrected,
-   * not moved, so it is placed rather than animated.
+   * The fix is to finish one axis before starting the other, which is what
+   * walking on a grid means. Deliberately a chase and not a replay: the model
+   * always heads for where the player *is*, so when they stop it arrives and
+   * stops with them. Replaying a queue of past tiles instead leaves it walking
+   * a route the player already finished — movement with nobody driving it —
+   * and then sprinting to catch up.
    */
   function advanceNetVisual(np: NetPlayer, deltaTime: number): void {
-    // Fold any new authoritative tiles into the walk queue.
-    if (np.x !== np.queuedX || np.y !== np.queuedY) {
-      const gap = Math.abs(np.x - np.queuedX) + Math.abs(np.y - np.queuedY)
-      if (gap > MAX_VISUAL_CATCHUP) {
-        np.visualPath.length = 0
-        gridToWorldInPlace(np.x, np.y, _tmpGridVec)
-        np.visualX = _tmpGridVec.x
-        np.visualZ = _tmpGridVec.z
-      } else {
-        // Rebuild an orthogonal route. The true one is unknown when two steps
-        // arrive together, but any grid-following route beats a diagonal.
-        let cx = np.queuedX
-        let cy = np.queuedY
-        while (cx !== np.x) {
-          cx += Math.sign(np.x - cx)
-          np.visualPath.push({ x: cx, y: cy })
-        }
-        while (cy !== np.y) {
-          cy += Math.sign(np.y - cy)
-          np.visualPath.push({ x: cx, y: cy })
-        }
-      }
-      np.queuedX = np.x
-      np.queuedY = np.y
+    gridToWorldInPlace(np.x, np.y, _tmpGridVec)
+    const targetX = _tmpGridVec.x
+    const targetZ = _tmpGridVec.z
+    let dx = targetX - np.visualX
+    let dz = targetZ - np.visualZ
+    const remaining = Math.abs(dx) + Math.abs(dz)
+
+    if (remaining < 1e-4) {
+      np.visualX = targetX
+      np.visualZ = targetZ
+      np.visualAxis = null
+      return
     }
 
-    if (np.visualPath.length === 0) return
+    // Further than any walk explains: this was a correction, not movement.
+    // Animating a teleport only makes it look like the character chose to go.
+    if (remaining > TILE_SIZE * MAX_VISUAL_CATCHUP) {
+      np.visualX = targetX
+      np.visualZ = targetZ
+      np.visualAxis = null
+      return
+    }
 
-    // One tile per moveDelay, plus a nudge when there is a backlog to clear.
-    let budget = (TILE_SIZE / Math.max(1, np.moveDelay)) * deltaTime
-    if (np.visualPath.length > 1) budget *= 1 + (np.visualPath.length - 1) * 0.6
+    // One tile per moveDelay. A model that has fallen behind hurries, but only
+    // a little — an uncapped catch-up is what made characters look like they
+    // were moving far faster than they are.
+    const behindTiles = remaining / TILE_SIZE
+    const hurry = Math.min(MAX_VISUAL_HURRY, 1 + behindTiles * 0.35)
+    let budget = (TILE_SIZE / Math.max(1, np.moveDelay)) * deltaTime * hurry
 
-    while (budget > 0 && np.visualPath.length > 0) {
-      const next = np.visualPath[0]
-      gridToWorldInPlace(next.x, next.y, _tmpGridVec)
-      const dx = _tmpGridVec.x - np.visualX
-      const dz = _tmpGridVec.z - np.visualZ
-      // Each hop is one orthogonal tile, so one of these is always zero.
-      const remaining = Math.abs(dx) + Math.abs(dz)
-      if (remaining <= budget || remaining < 1e-4) {
-        np.visualX = _tmpGridVec.x
-        np.visualZ = _tmpGridVec.z
-        budget -= remaining
-        np.visualPath.shift()
-      } else {
-        const t = budget / remaining
-        np.visualX += dx * t
-        np.visualZ += dz * t
-        budget = 0
+    while (budget > 0 && (Math.abs(dx) > 1e-4 || Math.abs(dz) > 1e-4)) {
+      // Finish the axis already in motion; only then turn the corner. Starting
+      // the second axis early is exactly the diagonal.
+      if (np.visualAxis === 'x' && Math.abs(dx) <= 1e-4) np.visualAxis = null
+      if (np.visualAxis === 'z' && Math.abs(dz) <= 1e-4) np.visualAxis = null
+      if (np.visualAxis === null) {
+        const hasX = Math.abs(dx) > 1e-4
+        const hasZ = Math.abs(dz) > 1e-4
+        // With both axes to cover, lead with the one they were last walking
+        // along — that is the order they actually turned the corner in.
+        // Grid x runs along world x, grid y along world z.
+        if (hasX && hasZ) np.visualAxis = np.lastDx !== 0 ? 'x' : 'z'
+        else np.visualAxis = hasX ? 'x' : 'z'
       }
+
+      const along = np.visualAxis === 'x' ? dx : dz
+      const step = Math.min(Math.abs(along), budget) * Math.sign(along)
+      if (np.visualAxis === 'x') {
+        np.visualX += step
+        dx -= step
+      } else {
+        np.visualZ += step
+        dz -= step
+      }
+      budget -= Math.abs(step)
+      if (Math.abs(step) < 1e-9) break
     }
   }
 
