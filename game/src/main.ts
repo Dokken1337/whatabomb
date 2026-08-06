@@ -55,6 +55,7 @@ import {
   accrue,
   appendWaypoints,
   isDue,
+  MAX_SPEED,
   moveDelayForSpeed,
   pruneWaypoints,
   replay,
@@ -685,28 +686,42 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         ctx.lineWidth = 6
         ctx.strokeRect(3, 3, w - 6, h - 6)
       } else if (theme === 'lava') {
-        // LAVA: Volcanic rock with glowing cracks
-        ctx.fillStyle = '#2a1a1a'
+        // LAVA: glowing magma rock, deliberately the warmest thing on screen.
+        //
+        // This was near-black (#1a0a0a inside #2a1a1a) sitting on near-black
+        // ground beside near-black walls — three surfaces you could not tell
+        // apart. The crate is the one that has to read as breakable, so it is
+        // now the saturated one: hot rock against grey stone walls and dark
+        // basalt floor, separated by hue as well as by brightness.
+        ctx.fillStyle = '#5c2a19'
         ctx.fillRect(0, 0, w, h)
-        ctx.fillStyle = '#1a0a0a'
-        ctx.fillRect(6, 6, w - 12, h - 12)
-        // Glowing magma cracks
-        ctx.strokeStyle = '#ff4400'
-        ctx.lineWidth = 3
+        const rock = ctx.createLinearGradient(0, 0, w, h)
+        rock.addColorStop(0, '#8f4526')
+        rock.addColorStop(0.55, '#7a3a24')
+        rock.addColorStop(1, '#5e2c1b')
+        ctx.fillStyle = rock
+        ctx.fillRect(8, 8, w - 16, h - 16)
+        // Glowing magma cracks, bright enough to survive the ambient light.
+        ctx.strokeStyle = '#ffb03a'
+        ctx.lineWidth = 4
         ctx.shadowColor = '#ff6600'
-        ctx.shadowBlur = 6
+        ctx.shadowBlur = 8
         ctx.beginPath()
         ctx.moveTo(10, 40); ctx.lineTo(45, 55); ctx.lineTo(50, 90)
         ctx.moveTo(70, 10); ctx.lineTo(80, 50); ctx.lineTo(120, 70)
         ctx.stroke()
         ctx.shadowBlur = 0
         // Pumice holes
-        ctx.fillStyle = '#0a0505'
+        ctx.fillStyle = '#3a1a10'
         for (let i = 0; i < 5; i++) {
           ctx.beginPath()
           ctx.arc(20 + Math.random() * 88, 20 + Math.random() * 88, 3 + Math.random() * 3, 0, Math.PI * 2)
           ctx.fill()
         }
+        // Hard rim so the silhouette stays crisp, same reasoning as the ice block.
+        ctx.strokeStyle = '#2a1109'
+        ctx.lineWidth = 6
+        ctx.strokeRect(3, 3, w - 6, h - 6)
       } else if (theme === 'forest') {
         // FOREST: a wooden crate, deliberately not foliage.
         //
@@ -843,41 +858,61 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         ctx.moveTo(0, 80); ctx.lineTo(64, 65); ctx.lineTo(128, 90)
         ctx.stroke()
       } else if (theme === 'lava') {
-        // Dark obsidian with orange veins
-        ctx.fillStyle = '#1a1010'
+        // Pale volcanic stone — the *lightest* surface in the theme.
+        //
+        // Obsidian was the obvious choice and the wrong one: near-black walls
+        // on near-black ground next to near-black crates. A permanent wall has
+        // to be the thing you read first, so it is cooled grey stone, and the
+        // heat lives in the cracks between the blocks instead of in the rock.
+        ctx.fillStyle = '#6f6259'
         ctx.fillRect(0, 0, w, h)
-        ctx.fillStyle = '#252015'
-        ctx.fillRect(4, 4, w - 8, h - 8)
-        // Glowing veins
-        ctx.strokeStyle = '#cc3300'
-        ctx.lineWidth = 2
-        ctx.shadowColor = '#ff4400'
-        ctx.shadowBlur = 4
+        ctx.fillStyle = '#9a8d82'
+        ctx.fillRect(5, 5, w - 10, h - 10)
+        // Block courses, so it reads as built rather than as a dark hole.
+        ctx.strokeStyle = '#574b43'
+        ctx.lineWidth = 4
         ctx.beginPath()
-        ctx.moveTo(0, 64); ctx.lineTo(30, 50); ctx.lineTo(60, 70); ctx.lineTo(128, 55)
+        ctx.moveTo(0, 44); ctx.lineTo(w, 44)
+        ctx.moveTo(0, 88); ctx.lineTo(w, 88)
+        ctx.moveTo(64, 0); ctx.lineTo(64, 44)
+        ctx.moveTo(30, 88); ctx.lineTo(30, h)
+        ctx.stroke()
+        // A little heat in the seams, not across the whole face.
+        ctx.strokeStyle = '#d4551a'
+        ctx.lineWidth = 2
+        ctx.shadowColor = '#ff6a1e'
+        ctx.shadowBlur = 5
+        ctx.beginPath()
+        ctx.moveTo(0, 46); ctx.lineTo(40, 44); ctx.lineTo(90, 47); ctx.lineTo(w, 45)
         ctx.stroke()
         ctx.shadowBlur = 0
       } else if (theme === 'forest') {
-        // Tree bark
-        ctx.fillStyle = '#4a3020'
+        // Pale birch, the lightest surface in the theme.
+        //
+        // Dark bark put the walls at the same near-black value as the forest
+        // floor, so open ground and solid wall looked alike. Birch separates
+        // them by brightness, and its neutral colour keeps it clear of the warm
+        // timber crates too — the three surfaces differ in value *and* hue.
+        ctx.fillStyle = '#b8ae99'
         ctx.fillRect(0, 0, w, h)
-        // Bark grain lines
-        ctx.strokeStyle = '#3a2515'
-        ctx.lineWidth = 3
-        for (let i = 0; i < 8; i++) {
-          const y = 8 + i * 15
-          ctx.beginPath()
-          ctx.moveTo(0, y); ctx.lineTo(40, y + 4); ctx.lineTo(90, y - 2); ctx.lineTo(128, y + 3)
-          ctx.stroke()
+        ctx.fillStyle = '#c9c0ab'
+        ctx.fillRect(4, 4, w - 8, h - 8)
+        // Lenticels — the dark horizontal dashes that say "birch" at a glance.
+        ctx.fillStyle = '#3f3a30'
+        for (let i = 0; i < 9; i++) {
+          const y = 10 + i * 13
+          const x = 8 + Math.random() * 60
+          ctx.fillRect(x, y, 18 + Math.random() * 26, 4)
+        }
+        ctx.fillStyle = 'rgba(63,58,48,0.55)'
+        for (let i = 0; i < 6; i++) {
+          ctx.fillRect(60 + Math.random() * 50, 14 + Math.random() * 100, 12 + Math.random() * 18, 3)
         }
         // Knot
-        ctx.fillStyle = '#2a1a0a'
+        ctx.fillStyle = '#6b6353'
         ctx.beginPath()
-        ctx.ellipse(64, 64, 12, 18, 0, 0, Math.PI * 2)
+        ctx.ellipse(96, 70, 9, 13, 0, 0, Math.PI * 2)
         ctx.fill()
-        ctx.strokeStyle = '#3a2515'
-        ctx.lineWidth = 2
-        ctx.stroke()
       } else if (theme === 'space') {
         // Metal panel
         ctx.fillStyle = '#4a4a5a'
@@ -967,9 +1002,13 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       const h = 128
       
       // Base background
-      ctx.fillStyle = theme === 'ice' ? '#e8f4f8' : 
-                      theme === 'lava' ? '#2a0a0a' : 
-                      theme === 'forest' ? '#0a2a0a' :
+      // Lava and forest are lifted well off black here. The floor colour is
+      // multiplied by the map's ground tint, and a dark texture times a dark
+      // tint is just black — which is how open ground ended up the same value
+      // as the walls in both themes.
+      ctx.fillStyle = theme === 'ice' ? '#e8f4f8' :
+                      theme === 'lava' ? '#4a3833' :
+                      theme === 'forest' ? '#2c5a26' :
                       theme === 'moon' ? '#2a2a2e' : '#1a1a1a'
       ctx.fillRect(0, 0, w, h)
       
@@ -997,13 +1036,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         ctx.fillRect(0, 0, w, h)
         
       } else if (theme === 'lava') {
-        // LAVA: Industrial grate or plating look
-        // Dark metallic plates with heat glow from underneath
-        ctx.fillStyle = '#111'
+        // LAVA: cooled basalt plating with heat glowing up between the plates.
+        // Kept the darkest of the three surfaces — it is the empty space — but
+        // no longer so dark that the plate detail and the walls vanish into it.
+        ctx.fillStyle = '#382b27'
         ctx.fillRect(10, 10, w-20, h-20) // Inner plate
-        
+
         // Corner bolts
-        ctx.fillStyle = '#333'
+        ctx.fillStyle = '#6a574f'
         const r = 4
         ctx.beginPath(); ctx.arc(16, 16, r, 0, Math.PI*2); ctx.fill()
         ctx.beginPath(); ctx.arc(w-16, 16, r, 0, Math.PI*2); ctx.fill()
@@ -4279,8 +4319,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           hasThrow = true
           console.log('Player 1: Throw ability acquired!')
         } else if (powerUp.type === 'speed') {
-          playerSpeed++
-          moveDelay = Math.max(50, 150 - (playerSpeed - 1) * 30)
+          // Same curve as online. These were separate formulas with different
+          // floors, so the identical pickup made you a fifth faster in single
+          // player than in a match.
+          playerSpeed = Math.min(MAX_SPEED, playerSpeed + 1)
+          moveDelay = moveDelayForSpeed(playerSpeed)
           console.log('Player 1: Speed increased! Speed:', playerSpeed)
         } else if (powerUp.type === 'shield') {
           shieldCharges = Math.min(3, shieldCharges + 1)
@@ -4342,8 +4385,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           player2HasThrow = true
           console.log('Player 2: Throw ability acquired!')
         } else if (powerUp.type === 'speed') {
-          player2Speed++
-          player2MoveDelay = Math.max(50, 150 - (player2Speed - 1) * 30)
+          player2Speed = Math.min(MAX_SPEED, player2Speed + 1)
+          player2MoveDelay = moveDelayForSpeed(player2Speed)
           console.log('Player 2: Speed increased! Speed:', player2Speed)
         } else if (powerUp.type === 'shield') {
           player2ShieldCharges = Math.min(3, player2ShieldCharges + 1)
@@ -5786,7 +5829,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       else if (pu.type === 'kick') np.hasKick = true
       else if (pu.type === 'throw') np.hasThrow = true
       else if (pu.type === 'speed') {
-        np.speed++
+        np.speed = Math.min(MAX_SPEED, np.speed + 1)
         np.moveDelay = moveDelayForSpeed(np.speed)
       }
       // Extended pool. These were missing entirely, so online the pickup was

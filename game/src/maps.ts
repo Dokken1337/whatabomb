@@ -61,8 +61,8 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     name: 'Small Lava Arena',
     description: 'Intense volcanic action',
     colors: {
-      ground: new Color3(0.4, 0.1, 0.05), // Brighter lava ground
-      wall: new Color3(0.3, 0.2, 0.2), 
+      ground: new Color3(0.75, 0.62, 0.58), // Basalt tint; the floor texture carries the colour
+      wall: new Color3(0.82, 0.78, 0.74), // Pale stone, the lightest surface here
     },
   },
   'small-forest': {
@@ -73,8 +73,8 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     name: 'Small Forest Arena',
     description: 'Quick woodland skirmishes',
     colors: {
-      ground: new Color3(0.25, 0.55, 0.2), // Vibrant forest green
-      wall: new Color3(0.22, 0.15, 0.09), // Dark bark, well below the crate in value
+      ground: new Color3(0.55, 0.78, 0.45), // Vibrant forest green
+      wall: new Color3(0.72, 0.70, 0.62), // Pale birch, well above the floor in value
     },
   },
   'medium-classic': {
@@ -109,8 +109,8 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     name: 'Lava Arena',
     description: 'Volcanic battlefield with fiery colors',
     colors: {
-      ground: new Color3(0.4, 0.1, 0.05),
-      wall: new Color3(0.3, 0.2, 0.2), 
+      ground: new Color3(0.75, 0.62, 0.58),
+      wall: new Color3(0.82, 0.78, 0.74), // Pale stone, the lightest surface here
     },
   },
   'medium-forest': {
@@ -121,8 +121,8 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     name: 'Forest Arena',
     description: 'Natural battlefield with earthy colors',
     colors: {
-      ground: new Color3(0.25, 0.55, 0.2),
-      wall: new Color3(0.22, 0.15, 0.09), // Dark bark, well below the crate in value
+      ground: new Color3(0.55, 0.78, 0.45),
+      wall: new Color3(0.72, 0.70, 0.62), // Pale birch, well above the floor in value
     },
   },
   'medium-space': {
@@ -169,8 +169,8 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     name: 'Large Lava Arena',
     description: 'Massive volcanic warzone',
     colors: {
-      ground: new Color3(0.3, 0.1, 0.05),
-      wall: new Color3(0.2, 0.2, 0.2),
+      ground: new Color3(0.68, 0.56, 0.52),
+      wall: new Color3(0.78, 0.74, 0.70),
     },
   },
   'large-forest': {
@@ -181,8 +181,8 @@ export const MAP_CONFIGS: Record<string, MapConfig> = {
     name: 'Large Forest Arena',
     description: 'Sprawling woodland battleground',
     colors: {
-      ground: new Color3(0.2, 0.4, 0.15),
-      wall: new Color3(0.20, 0.14, 0.08), // Dark bark, well below the crate in value
+      ground: new Color3(0.48, 0.68, 0.38),
+      wall: new Color3(0.68, 0.66, 0.58), // Pale birch, well above the floor in value
     },
   },
   'chaos-neon': {

@@ -91,9 +91,30 @@ export function settle(credit: number, delay: number, stepped: boolean): number 
   return stepped ? credit - delay : delay
 }
 
-/** Milliseconds between steps at a given speed level. */
+/**
+ * Speed levels past this do nothing, so the pickup stops counting there.
+ *
+ * Pinned to where the delay floor bites: a counter that keeps climbing after
+ * the character has stopped getting faster is just a number lying on the HUD.
+ */
+export const MAX_SPEED = 5
+
+/**
+ * Milliseconds between steps at a given speed level.
+ *
+ * 150ms down to 90ms in five steps. The floor is a game-feel decision with a
+ * netcode consequence attached: speed multiplies every disagreement between
+ * what a player sees and what the host knows, because the gap is measured in
+ * tiles and a faster player covers more of them per round trip. At 60ms a tile
+ * — where this floor used to sit — a 300ms round trip is five tiles of honest
+ * disagreement. At 90ms it is three.
+ *
+ * The step is 15ms rather than 30 so the floor still takes five pickups to
+ * reach. Dropping the ceiling without also softening the step would have made
+ * the whole pickup two useful levels deep.
+ */
 export function moveDelayForSpeed(speed: number): number {
-  return Math.max(60, 150 - (speed - 1) * 30)
+  return Math.max(90, 150 - (Math.min(speed, MAX_SPEED) - 1) * 15)
 }
 
 /**

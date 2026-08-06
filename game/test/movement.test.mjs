@@ -17,6 +17,7 @@ import {
   run,
   replay,
   moveDelayForSpeed,
+  MAX_SPEED,
   appendWaypoints,
   sampleAt,
   pruneWaypoints,
@@ -106,10 +107,21 @@ test('settle charges a taken step and holds a refused one', () => {
 })
 
 test('speed levels map to the delays the game advertises', () => {
-  assert.equal(moveDelayForSpeed(1), 150)
-  assert.equal(moveDelayForSpeed(3), 90)
-  assert.equal(moveDelayForSpeed(5), 60)
-  assert.equal(moveDelayForSpeed(9), 60, 'floored, never faster')
+  assert.deepEqual(
+    [1, 2, 3, 4, 5].map(moveDelayForSpeed),
+    [150, 135, 120, 105, 90],
+  )
+})
+
+test('the speed counter stops exactly where the delay stops improving', () => {
+  // A counter that keeps climbing after the character has stopped getting
+  // faster is a number lying on the HUD. The cap and the floor have to meet.
+  assert.equal(moveDelayForSpeed(MAX_SPEED), 90)
+  for (const beyond of [MAX_SPEED + 1, MAX_SPEED + 5, 50]) {
+    assert.equal(moveDelayForSpeed(beyond), 90, `speed ${beyond} buys nothing`)
+  }
+  // And the level below the cap must still be worth picking up.
+  assert.ok(moveDelayForSpeed(MAX_SPEED - 1) > 90)
 })
 
 test('replay lands where a host that simulated the same span would', () => {
