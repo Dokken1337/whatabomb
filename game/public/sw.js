@@ -1,5 +1,5 @@
 // Bumped per release so the activate handler drops the previous cache.
-const CACHE_NAME = 'whatabomb-v1-15-0'
+const CACHE_NAME = 'whatabomb-v1-18-0'
 const PRECACHE_URLS = [
   './',
   './index.html',

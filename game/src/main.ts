@@ -5398,10 +5398,17 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   let rttEstimate = 250
   /** When each input went out, so an ack can be turned into a round trip. */
   const inputSentAt = new Map<number, number>()
-  /** Wall clock of the last snapshot this guest applied. */
-  let lastSnapshotReceivedAt = 0
   /** `tick` of that snapshot — the host's clock, echoed back with our input. */
   let lastAppliedTick = 0
+  /**
+   * The last position the host reported for us, and the moment on our own clock
+   * it had simulated us through. Everything we draw is derived from this pair
+   * plus the inputs we have sent since. See deriveLocalPosition.
+   */
+  let localAuthoritative: { x: number; y: number; credit: number } | null = null
+  let localSimAt = 0
+  /** performance.now() when that arrived, so derivation can stop if it dries up. */
+  let localAuthorityAt = 0
   /**
    * Stop predicting once the host has been quiet this long.
    *
@@ -5410,8 +5417,6 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * happily walk the length of the arena into a world that stopped existing.
    */
   const PREDICT_BLIND_MS = 1000
-  /** Held direction as of the last frame, so a fresh press can act at once. */
-  let lastPredictedDirection = '0,0'
 
   /** Bomb meshes a guest is showing, keyed by the host's bomb id. */
   const guestBombMeshes = new Map<number, any>()
@@ -5700,6 +5705,28 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       settleMovement(np, true)
       collectNetPowerUps(np)
     }
+
+    // Hand back steps that were never earned.
+    //
+    // A held direction keeps being applied until we are told otherwise, so
+    // while a release is on the wire this end carries on walking — and it is
+    // still walking for the whole time that message spends in flight. Correcting
+    // only the clock left those extra tiles standing: the player let go, and
+    // their character took another step or two anyway, which is precisely the
+    // phantom movement everyone else sees.
+    //
+    // Negative credit is exactly the measure of it — time spent that was never
+    // owed — and one step costs one moveDelay, so the arithmetic converts
+    // straight back into tiles.
+    for (let given = 0; given < 2 && np.moveCredit < 0; given++) {
+      const bx = np.x - dx
+      const by = np.y - dy
+      if (!netCanWalk(np, bx, by)) break
+      np.x = bx
+      np.y = by
+      np.moveCredit += np.moveDelay
+    }
+    if (np.moveCredit < 0) np.moveCredit = 0
   }
 
   /**
@@ -5990,22 +6017,18 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       if (seq <= sp.ackSeq) inputSentAt.delete(seq)
     }
 
-    const derived = replay(
-      { x: sp.x, y: sp.y, credit: sp.credit },
-      np.moveDelay,
-      sentInputs,
-      sp.simAt,
-      performance.now(),
-      (x, y) => netCanWalk(np, x, y),
-    )
-    np.x = derived.x
-    np.y = derived.y
-    np.moveCredit = derived.credit
+    // Remember what the host said, and from now on derive from it. The actual
+    // position is computed in deriveLocalPosition, which runs every frame — the
+    // arrival of a snapshot is just new ground to derive from, not a separate
+    // kind of event with its own arithmetic.
+    localAuthoritative = { x: sp.x, y: sp.y, credit: sp.credit }
+    localSimAt = sp.simAt
+    localAuthorityAt = performance.now()
+    deriveLocalPosition(np)
   }
 
   /** Guests reconcile their world to the host's snapshot. */
   function applySnapshot(snapshot: WorldSnapshot): void {
-    lastSnapshotReceivedAt = Date.now()
     for (const sp of snapshot.players) {
       const np = netPlayerById(sp.id)
       if (!np) continue
@@ -6365,23 +6388,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         online.net.send({ t: 'state', tick: now, payload: buildSnapshot() })
       }
     } else {
-      // Sustained movement is predicted here, on the tick, rather than once per
-      // rendered frame.
-      //
-      // Both sides gate a step on the same moveDelay, but each rounds the wait
-      // up to its own next opportunity: the host to its 33ms tick, a guest
-      // rendering at 60Hz to a 16ms frame. That makes the guest a few percent
-      // faster — which does not sound like much until it compounds, a tile of
-      // unearned lead every ten seconds or so, and every tile of lead is one the
-      // host eventually takes back. Predicting on the same tick the host uses
-      // makes the two rates identical, so the gap between them stays at the
-      // latency and stops growing.
-      if (local && local.alive) predictLocalStep(local, input, stepMs)
-
-      // Safety net only — the frame loop normally publishes the moment a key
-      // changes, which is the whole point. This catches the case where frames
-      // have stalled but the tick is still running.
+      // Safety net only — the frame loop normally does both of these, and does
+      // them sooner. This catches the case where frames have stalled but the
+      // tick is still running. Neither accumulates anything, so doing them twice
+      // in a frame is harmless: the position is derived, not stepped.
       publishLocalInput(input)
+      if (local && local.alive) deriveLocalPosition(local)
     }
   }
 
@@ -6428,83 +6440,78 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   }
 
   /**
-   * Apply the local player's movement optimistically, under the host's rules.
+   * Work out where the local player is, from the host's last word plus our own
+   * inputs since. Guests only.
    *
-   * Deliberately movement only. Bombs, pickups and damage stay entirely with
-   * the host — predicting those would mean showing outcomes that might not
-   * survive reconciliation, and a bomb that appears and then vanishes is worse
-   * than one that appears a few frames late.
+   * Deliberately a derivation and not an accumulation, and that distinction is
+   * the whole point. Stepping a local clock forward in tick-sized lumps while
+   * *also* re-deriving from the host produced two answers to the same question:
+   * a tick grants a whole 33ms even when a key was held for 27 of them, whereas
+   * the host is told the exact duration and credits exactly that. The two ends
+   * then disagreed by up to a tick on every press, which surfaced as a step the
+   * player did not ask for.
+   *
+   * Deriving both ways from the same inputs removes the disagreement by removing
+   * the second answer. Prediction and reconciliation are now the same operation
+   * — the arrival of a snapshot merely gives it newer ground to stand on.
+   *
+   * Movement only, as before: bombs, pickups and damage stay with the host.
    */
-  function predictLocalStep(np: NetPlayer, input: { dx: number; dy: number }, stepMs: number): void {
-    const { dx, dy } = input
-    const holding = dx !== 0 || dy !== 0
-    // Run the clock even when idle, so standing still caps the bank exactly as
-    // it does on the host.
-    const due = movementDue(np, stepMs, holding)
-    if (!holding) return
+  function deriveLocalPosition(np: NetPlayer): void {
+    if (!localAuthoritative) return
 
-    np.lastDx = dx
-    np.lastDy = dy
-    faceDirection(np.mesh, dx, dy)
-    if (!due) return
-
-    // Prediction runs free only while the host is still talking to us. Gone
-    // quiet, it is running on nothing — a dropped connection would otherwise
-    // let a guest walk the length of an arena that stopped existing. There is
-    // no cap on how far ahead it may get any more: reconciliation re-derives
-    // the position rather than guessing, so being further ahead costs nothing
-    // to put right.
-    if (Date.now() - lastSnapshotReceivedAt > PREDICT_BLIND_MS) {
-      settleMovement(np, false)
-      return
-    }
-    const tx = np.x + dx
-    const ty = np.y + dy
-    if (!netCanWalk(np, tx, ty)) {
-      settleMovement(np, false)
-      return
+    const held = readLocalMoveDirection()
+    if (held.dx !== 0 || held.dy !== 0) {
+      np.lastDx = held.dx
+      np.lastDy = held.dy
+      faceDirection(np.mesh, held.dx, held.dy)
     }
 
-    np.x = tx
-    np.y = ty
-    settleMovement(np, true)
+    // Derivation runs free only while the host is still talking to us. Gone
+    // quiet it is running on nothing, and a dropped connection would otherwise
+    // walk a guest the length of an arena that stopped existing — so the clock
+    // it derives against stops a beat after the last thing we heard.
+    const nowAt = Math.min(performance.now(), localAuthorityAt + PREDICT_BLIND_MS)
+
+    const derived = replay(
+      localAuthoritative,
+      np.moveDelay,
+      sentInputs,
+      localSimAt,
+      nowAt,
+      (x, y) => netCanWalk(np, x, y),
+    )
+    np.x = derived.x
+    np.y = derived.y
+    np.moveCredit = derived.credit
   }
 
   /** Visual-only: smooth meshes toward their authoritative grid position. */
   function renderOnlineVisuals(deltaTime: number): void {
-    // A direction that has just changed is predicted immediately, without
-    // waiting for the next tick.
-    //
-    // This is the one case where the tick's 33ms is felt: a fresh keypress that
-    // lands just after a tick would otherwise sit there before anything moved,
-    // which reads as the controls answering late. Holding a direction is left
-    // to the tick, where it steps at exactly the host's rate — see
-    // simulateOnlineTick.
+    // Publish first, then derive — in that order, so a key pressed this frame is
+    // already in the buffer the derivation reads. Both are cheap and neither
+    // accumulates anything, so running them every frame costs nothing and gives
+    // the controls the fastest possible answer.
     if (online && !online.isHost && !isPaused && !gameOver) {
-      const me = localNetPlayer()
-      const held = readLocalMoveDirection()
-      const direction = `${held.dx},${held.dy}`
-      if (direction !== lastPredictedDirection) {
-        lastPredictedDirection = direction
-        // No time is banked here — this only spends what a fresh press has
-        // already earned by standing still. The tick owns the clock.
-        if (me && me.alive) predictLocalStep(me, held, 0)
-      }
-      // Publish every frame, not just on a turn: this also carries a bomb press
-      // out at once instead of holding it for the tick. The send itself is a
-      // no-op unless something changed.
       publishLocalInput(readLocalNetInput())
+      const me = localNetPlayer()
+      if (me && me.alive) deriveLocalPosition(me)
     }
 
-    // Two different jobs, deliberately. Our own character is predicted, so its
-    // position is already the present and has to be drawn immediately or the
-    // controls feel dead. Everybody else is only ever known from reports, so
-    // they are drawn a fixed moment behind the newest one — always between two
-    // known positions rather than chasing the latest.
+    // Interpolation is for positions that arrive as reports, and only a guest
+    // receives those. The host computes everybody directly, every tick, with no
+    // delay to smooth over — so it draws them all the immediate way. Sending
+    // the host down the buffered path froze every other player on its screen
+    // outright, because nothing on a host ever fills that buffer.
+    //
+    // A guest still draws *itself* immediately: its own position is predicted,
+    // so it is already the present, and delaying it would make the controls
+    // feel dead.
+    const buffered = online !== undefined && !online.isHost
     const drawAt = Date.now() - INTERP_DELAY_MS
     for (const np of netPlayers) {
-      if (np.isLocal) advanceNetVisual(np, deltaTime)
-      else drawReportedPlayer(np, drawAt)
+      if (buffered && !np.isLocal) drawReportedPlayer(np, drawAt)
+      else advanceNetVisual(np, deltaTime)
       np.mesh.position.x = np.visualX
       np.mesh.position.z = np.visualZ
     }
