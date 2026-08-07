@@ -199,7 +199,6 @@ function setCharacterVisibility(root: TransformNode, value: number) {
 interface OnlineContext {
   net: NetClient
   seed: number
-  round: number
   youId: string
   isHost: boolean
   roster: Array<{ id: string; name: string; slot: number }>
@@ -290,6 +289,13 @@ interface NetPlayer {
   input: { dx: number; dy: number; bomb: boolean }
   /** Highest input sequence seen, so out-of-order frames are dropped. */
   inputSeq: number
+  /**
+   * Whether the lobby last reported this player as away. Host only.
+   *
+   * Only an edge is interesting: it is the transition back that means somebody
+   * has missed whatever the snapshots have been leaving out.
+   */
+  wasAbsent: boolean
 }
 
 /**
@@ -2201,6 +2207,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         hasLineBomb: false,
         input: { dx: 0, dy: 0, bomb: false },
         inputSeq: -1,
+        wasAbsent: false,
       })
     }
 
@@ -4786,8 +4793,6 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // host never heard about it. Touch players simply could not bomb.
       if (online) {
         netBombRequested = true
-        const local = localNetPlayer()
-        if (local) local.input.bomb = true
         // The host's snapshot is a round trip away; buzz now so the button
         // still feels like it responded.
         haptic(30)
@@ -5093,10 +5098,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     }
 
     // Online: bomb is edge-triggered and resolved by the host.
+    //
+    // `netBombRequested` is the whole mechanism. This used to set the local
+    // player's input slot as well, which was a second copy of the same fact
+    // set and cleared in the same cycle by the same tick — and on a guest it
+    // was worse than redundant, since nothing on a guest ever reads that slot
+    // or clears it, so the flag simply latched true for the rest of the match.
     if (online && (ev.key === ' ' || ev.key === 'Enter')) {
       netBombRequested = true
-      const local = localNetPlayer()
-      if (local) local.input.bomb = true
       return
     }
 
@@ -5335,25 +5344,59 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       onLobby: lobby => {
         previous?.onLobby?.(lobby)
         if (!online.isHost) return
-        // Stop simulating someone who is no longer there.
-        //
-        // A held direction stands until the player says otherwise, and a player
-        // whose socket has dropped never will — so the host walked them on
-        // until they hit a wall, and everyone watched a disconnected character
-        // stroll across the arena. Their seat is held for the grace period, so
-        // this is a pause rather than a removal: zeroing the input is enough,
-        // and leaving their movement clock alone is what lets settleHeldDirection
-        // treat their return as a fresh press.
-        for (const seat of lobby.players) {
+        for (const np of netPlayers) {
+          if (np.isLocal) continue
+          const seat = lobby.players.find(p => p.id === np.id)
+
+          // Somebody has come back. Everything the snapshots left out while
+          // they were away — loadouts, the power-up layout — was left out on
+          // the understanding that the receiver had been told once, and they
+          // are the one receiver that was not. The periodic keyframe would
+          // repair this within the second; saying it now means they never see
+          // a stale HUD at all.
+          if (seat?.connected && np.wasAbsent) forceFullSnapshot = true
+          if (seat) np.wasAbsent = !seat.connected
+
+          if (!seat) {
+            // Their seat is gone for good — the grace period lapsed, or they
+            // left. Until this, such a player stayed standing and *alive* in
+            // the host's world, and the round ends only when at most one player
+            // is left standing: a four-player round in which somebody closed
+            // their laptop could therefore never end at all, and the survivors
+            // were left hunting a character with nobody behind it. Taking them
+            // out of the round is what lets it finish.
+            np.input = { dx: 0, dy: 0, bomb: false }
+            if (np.alive) {
+              np.alive = false
+              setCharacterVisibility(np.mesh, 0)
+            }
+            continue
+          }
+
           if (seat.connected) continue
-          const np = netPlayerById(seat.id)
-          if (!np || np.isLocal) continue
+          // Still theirs for now, so this is a pause rather than a removal.
+          //
+          // A held direction stands until the player says otherwise, and a
+          // player whose socket has dropped never will — so the host walked
+          // them on until they hit a wall, and everyone watched a disconnected
+          // character stroll across the arena. Leaving their movement clock
+          // alone is what lets settleHeldDirection treat a return as a fresh
+          // press.
           np.input = { dx: 0, dy: 0, bomb: false }
         }
       },
       onState: state => {
         previous?.onState?.(state)
-        if (state !== 'open' || online.isHost) return
+        if (state !== 'open') return
+
+        if (online.isHost) {
+          // Snapshots sent while our own socket was down went nowhere, but the
+          // bookkeeping that decides what to leave out of the next one counted
+          // them as delivered. Say everything once, now.
+          forceFullSnapshot = true
+          return
+        }
+
         // Coming back from a drop, nothing we predicted across the gap is worth
         // keeping. The inputs still in the buffer are stamped from before it,
         // and replaying them against whatever the host says next would spend
@@ -5363,6 +5406,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         sentInputs.length = 0
         localAuthoritative = null
         lastSentInput = ''
+        // Bombs guessed at before the gap are equally stale — the ack that
+        // would have settled them belongs to a conversation that has ended.
+        for (let i = predictedBombs.length - 1; i >= 0; i--) discardPredictedBomb(i)
       },
       onRelayInput: msg => {
         // Host only: fold a guest's input into their player slot.
@@ -5390,11 +5436,34 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         np.input = { dx: msg.dx, dy: msg.dy, bomb: msg.bomb || np.input.bomb }
 
         beginHeldDirection(np)
+
+        // Tell everyone now rather than on the next tick. This player has just
+        // been moved, and the other guests are watching a character that has
+        // not started walking yet — a delay that costs nothing to remove, since
+        // the rate ceiling inside decides whether it is really sent.
+        maybeSendSnapshot()
       },
       onRelayState: msg => {
-        // Guest only: adopt the host's world. The tick is the host's own clock;
-        // hold it so our next input can hand it straight back and let the host
-        // time the round trip without either of us reading the other's clock.
+        // Never apply the same snapshot twice.
+        //
+        // Most of a snapshot is state, and applying it again is merely wasted
+        // work — but `blasts` and `cleared` are one-shot events, so a duplicate
+        // detonates the same explosion a second time: the screen shakes twice
+        // and the bang plays twice, for a bomb that went off once.
+        //
+        // A duplicate is not hypothetical. A client that reconnects onto a
+        // different instance leaves the old instance still holding its seat, so
+        // both write it every snapshot until the heartbeat reaps the stale one.
+        // That is worth fixing where it starts, but it is worth refusing here
+        // regardless: "the same world, twice" has no correct interpretation, so
+        // no cause of it should be able to double an explosion. The host's tick
+        // is its own clock and snapshots are at least a rate-limit apart, so
+        // equal ticks mean one message, twice.
+        if (msg.tick === lastAppliedTick) return
+
+        // The tick is the host's own clock; hold it so our next input can hand
+        // it straight back and let the host time the round trip without either
+        // of us reading the other's clock.
         lastAppliedTick = msg.tick
         observeSnapshotArrival(Date.now())
         applySnapshot(msg.payload as WorldSnapshot)
@@ -5446,6 +5515,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   let lastSnapshotAt = 0
   /** When the last snapshot carrying everything went out. Host only. */
   let lastFullSnapshotAt = 0
+  /**
+   * Say everything in the next snapshot, whatever the schedule. Host only.
+   *
+   * Set whenever somebody's understanding of the world may have gone stale
+   * through no fault of the delta scheme — a guest that was away, or our own
+   * socket having been down while we carried on pruning as though it were not.
+   */
+  let forceFullSnapshot = false
   let roundReported = false
   /**
    * Inputs this guest has sent, newest last, with their own clock stamps.
@@ -5482,9 +5559,54 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /** `x,y` of every bomb in the last snapshot, so prediction can see them. */
   const guestBombTiles = new Set<string>()
   const guestPowerUpMeshes = new Map<string, any>()
+  /** How many bombs of the local player's the last snapshot showed. Guests only. */
+  let guestOwnBombs = 0
 
+  /**
+   * A bomb this guest has asked for and not yet been told about.
+   *
+   * Placing a bomb was the one thing online play never predicted. Movement is
+   * answered on the frame the key goes down, but the bomb key did nothing at
+   * all until the host had heard about it, simulated it and sent a snapshot
+   * back — no sound, no squash, no bomb — so the central action of the game
+   * was the one place the whole round trip was visible. On a 200ms link that is
+   * a fifth of a second of pressing a button and being ignored, which is what
+   * "laggy" almost always turns out to mean.
+   */
+  interface PredictedBomb {
+    x: number
+    y: number
+    /** Input sequence that carried the request, so the ack can settle it. */
+    seq: number
+    mesh: any
+  }
+  const predictedBombs: PredictedBomb[] = []
+
+  /** How long an idle arena may go without a snapshot. */
   const SNAPSHOT_INTERVAL_MS = 66 // ~15Hz
-  const ONLINE_TICK_MS = 33 // ~30Hz simulation, independent of frame rate
+  /**
+   * Closest together two snapshots may be sent, however busy things get.
+   *
+   * The tick is faster than this on purpose — see ONLINE_TICK_MS — so without a
+   * floor, raising the simulation rate would have raised the send rate with it
+   * and doubled every guest's bandwidth for a smoothness nobody can see. What
+   * the faster tick is actually for is the host's own controls, which is a
+   * separate thing from how often everyone else is told.
+   */
+  const MIN_SNAPSHOT_GAP_MS = 33 // ~30Hz ceiling
+  /**
+   * Simulation rate, independent of frame rate.
+   *
+   * The host reads its own keyboard here rather than on the frame, so this is
+   * also the granularity of the host's controls: at 33ms the host was playing
+   * with up to a third of a tile of input delay that no guest suffered, because
+   * a guest's input is applied the moment it arrives rather than on a tick
+   * boundary. The host was the laggiest seat at the table, which is the last
+   * place anyone looks. Movement arithmetic is chunk-size independent by
+   * construction — see shared/movement.ts — so a faster tick changes only when
+   * things are noticed, never where anybody ends up.
+   */
+  const ONLINE_TICK_MS = 16
   /**
    * How often a snapshot carries everything rather than only what changed.
    *
@@ -5496,6 +5618,8 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   const FULL_SNAPSHOT_INTERVAL_MS = 1000
   /** How long the host lets the final explosion play before ending the round. */
   const ROUND_OVER_GRACE_MS = 1300
+  /** How often the host repeats an unacknowledged round result. */
+  const ROUND_RESULT_RETRY_MS = 1500
 
   /**
    * Is a bomb standing on this tile?
@@ -5622,6 +5746,119 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * only makes the delay steady rather than varying with whenever the last
    * report happened to land, and it is the variation that reads as stutter.
    */
+  /**
+   * How long the host may go quiet before a guest is told something is wrong.
+   *
+   * Comfortably longer than any ordinary gap between snapshots — an idle arena
+   * still sends one every 66ms — so this only ever fires on a real stall.
+   */
+  const HOST_SILENCE_MS = 2000
+
+  let stallBanner: HTMLDivElement | null = null
+
+  /**
+   * Show or clear "waiting for host".
+   *
+   * Prediction deliberately stops once the host has been quiet for a beat,
+   * rather than walking a guest into a world that has stopped existing — which
+   * is right, but from the player's side it is indistinguishable from the game
+   * having crashed. They mash keys at a frozen arena and give up. Naming the
+   * problem costs nothing and turns a hang into a wait, which is also what
+   * stops people force-reloading a match that was about to recover on its own.
+   */
+  function setHostSilent(silent: boolean): void {
+    if (silent === (stallBanner !== null)) return
+    if (!silent) {
+      stallBanner?.remove()
+      stallBanner = null
+      return
+    }
+    const banner = document.createElement('div')
+    banner.className = 'net-stall-banner'
+    banner.textContent = '⏳ Waiting for host…'
+    banner.style.position = 'absolute'
+    banner.style.top = 'calc(64px + env(safe-area-inset-top, 0px))'
+    banner.style.left = '50%'
+    banner.style.transform = 'translateX(-50%)'
+    banner.style.zIndex = '1500'
+    banner.style.padding = '8px 16px'
+    banner.style.borderRadius = '10px'
+    banner.style.color = 'white'
+    banner.style.whiteSpace = 'nowrap'
+    banner.style.fontFamily = "'Russo One', sans-serif"
+    banner.style.fontSize = '14px'
+    banner.style.background = 'rgba(0,0,0,0.75)'
+    banner.style.border = '2px solid rgba(255,170,0,0.6)'
+    banner.style.boxShadow = '0 4px 20px rgba(0,0,0,0.5)'
+    document.body.appendChild(banner)
+    stallBanner = banner
+  }
+
+  scene.onDisposeObservable.add(() => setHostSilent(false))
+
+  /** Drop a predicted bomb's mesh and forget it. */
+  function discardPredictedBomb(index: number): void {
+    const predicted = predictedBombs[index]
+    predictedBombs.splice(index, 1)
+    if (!predicted.mesh || predicted.mesh.isDisposed()) return
+    disposeBombMaterials(predicted.mesh)
+    predicted.mesh.getChildMeshes().forEach((c: any) => c.dispose())
+    predicted.mesh.dispose()
+  }
+
+  /**
+   * Show the bomb this guest just asked for, before the host has answered.
+   *
+   * Deliberately visual and audible only — the predicted bomb is *not* added to
+   * the tiles movement prediction treats as solid. That looks like a missing
+   * half of the feature and is not: replay re-derives the player's position
+   * from an authoritative one that can still be a tile or two behind, so a tile
+   * blocked here can be a tile replay has yet to walk *through*, and the player
+   * stalls where the host never stalled them. The real bomb starts blocking the
+   * moment the snapshot carrying it arrives, by which time the authoritative
+   * position is necessarily past it — and walking back onto a bomb you have
+   * just laid is the one move the game exists to punish, so nobody tries it
+   * inside a round trip.
+   *
+   * Refused placements are settled by the ack rather than by a timeout: the
+   * snapshot tells us the highest input the host has folded in, so the first
+   * one past this request that does not contain the bomb is a definite no.
+   */
+  function predictLocalBomb(seq: number): void {
+    const me = localNetPlayer()
+    if (!me || !me.alive) return
+    // The host refuses over capacity, so predicting one would only be a bomb
+    // that appears and is snatched away — the flicker is worse than the wait.
+    if (guestOwnBombs + predictedBombs.length >= me.maxBombs) return
+    if (predictedBombs.some(b => b.x === me.x && b.y === me.y)) return
+    if (guestBombTiles.has(`${me.x},${me.y}`)) return
+
+    const mesh = createBombMesh()
+    mesh.position = gridToWorld(me.x, me.y)
+    cacheBombChildRefs(mesh, mesh)
+    ;(mesh as any)._fuseMs = 2000
+    predictedBombs.push({ x: me.x, y: me.y, seq, mesh })
+
+    // The feedback that was missing entirely, now on the frame of the press.
+    if (soundManager) soundManager.playSFX('bomb-place')
+    haptic(10)
+    if ((me.mesh as any).triggerSquash) (me.mesh as any).triggerSquash()
+  }
+
+  /**
+   * Reconcile predicted bombs against what the host actually did.
+   *
+   * `ackSeq` is the exact answer: the host has folded in every input up to it,
+   * so a request at or below that seq with no bomb on its tile was declined.
+   */
+  function settlePredictedBombs(myAckSeq: number): void {
+    for (let i = predictedBombs.length - 1; i >= 0; i--) {
+      const predicted = predictedBombs[i]
+      const arrived = guestBombTiles.has(`${predicted.x},${predicted.y}`)
+      if (arrived || myAckSeq >= predicted.seq) discardPredictedBomb(i)
+    }
+  }
+
   /**
    * Run a guest's copy of the ghost clock down between the stats that carry it.
    *
@@ -6014,16 +6251,37 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return { dx, dy, bomb }
   }
 
-  /** What the last snapshot said, so the next tick can tell if anything moved. */
-  let lastSentWorld = ''
+  /** Fingerprint of the world as last described to the guests. */
+  let lastSentWorld = 0
 
-  /** A cheap fingerprint of the things guests reconcile their prediction against. */
-  function worldFingerprint(): string {
-    let sig = ''
-    for (const p of netPlayers) sig += `${p.x},${p.y},${p.alive ? 1 : 0};`
-    sig += '|'
-    for (const b of bombs) sig += `${b.x},${b.y};`
-    return sig
+  /**
+   * A cheap fingerprint of the things guests reconcile their prediction against.
+   *
+   * A number rather than a string, because this is now taken on every tick —
+   * sixty times a second — and again whenever an input arrives, purely to
+   * answer "has anything moved". Building a string to throw away at that rate
+   * is steady garbage on the one machine in the match that must not stutter,
+   * since every other player is waiting on its simulation.
+   *
+   * Collisions would cost one skipped snapshot, corrected by the next; the
+   * mixing is FNV-style over small integers, where that is vanishingly rare.
+   */
+  function worldFingerprint(): number {
+    let hash = 0x811c9dc5
+    const mix = (value: number) => {
+      hash ^= value + 0x9e3779b9
+      hash = Math.imul(hash, 0x01000193)
+    }
+    for (const p of netPlayers) {
+      mix(p.x)
+      mix(p.y * 97)
+      mix(p.alive ? 1 : 2)
+    }
+    for (const b of bombs) {
+      mix(b.x * 31)
+      mix(b.y * 131)
+    }
+    return hash | 0
   }
 
   /** The cold half of a player — see SnapshotPlayerStats. */
@@ -6115,12 +6373,24 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         y: b.y,
         timer: Math.round(b.timer),
         blast: b.blastRadius,
+        // Networked owners are encoded as 1000 + slot; anything else — an
+        // enemy, or the offline player — is nobody as far as a guest cares.
+        owner: b.ownerId !== undefined && b.ownerId >= 1000 ? b.ownerId - 1000 : -1,
       })),
       blasts: pendingBlasts.splice(0),
       cleared: pendingCleared.splice(0),
     }
     if (sendPowerUps) snapshot.powerUps = powerUps.map(p => ({ x: p.x, y: p.y, type: p.type }))
-    if (full) snapshot.full = true
+    if (full) {
+      snapshot.full = true
+      // One character per tile. Cheap enough to restate once a second, and the
+      // only way a receiver that missed a `cleared` event ever finds out.
+      let crates = ''
+      for (let y = 0; y < GRID_HEIGHT; y++) {
+        for (let x = 0; x < GRID_WIDTH; x++) crates += grid[y][x] === 'destructible' ? '1' : '0'
+      }
+      snapshot.crates = crates
+    }
     return snapshot
   }
 
@@ -6172,6 +6442,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   /** Guests reconcile their world to the host's snapshot. */
   function applySnapshot(snapshot: WorldSnapshot): void {
     let hudDirty = false
+    let myAckSeq = -1
 
     for (const sp of snapshot.players) {
       const np = netPlayerBySlot(sp.slot)
@@ -6186,6 +6457,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         }
       }
       if (np.isLocal) {
+        myAckSeq = sp.ackSeq
         reconcileLocal(np, sp)
       } else {
         np.x = sp.x
@@ -6267,9 +6539,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     // survives the move and can be slid across, matching what the host draws.
     const live = new Set<number>()
     guestBombTiles.clear()
+    const mySlot = localNetPlayer()?.slot ?? -1
+    guestOwnBombs = 0
     for (const sb of snapshot.bombs) {
       live.add(sb.id)
       guestBombTiles.add(`${sb.x},${sb.y}`)
+      if (sb.owner === mySlot) guestOwnBombs++
       let mesh = guestBombMeshes.get(sb.id)
       const target = gridToWorld(sb.x, sb.y)
 
@@ -6313,12 +6588,31 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       guestBombMeshes.delete(key)
     }
 
+    // Now that the real bombs are known, hand over or take back the ones this
+    // guest guessed at.
+    settlePredictedBombs(myAckSeq)
+
     // Replay the host's explosions and crate removals.
     for (const [x, y] of snapshot.cleared) {
       if (grid[y]?.[x] === 'destructible') {
         grid[y][x] = 'empty'
         if (removeCrateAt(x, y)) refreshShadows()
       }
+    }
+
+    // And, on a full snapshot, reconcile the arena as a whole — catching any
+    // crate whose removal we were not around to hear about.
+    if (snapshot.crates && snapshot.crates.length === GRID_WIDTH * GRID_HEIGHT) {
+      let removedAny = false
+      for (let y = 0; y < GRID_HEIGHT; y++) {
+        for (let x = 0; x < GRID_WIDTH; x++) {
+          if (grid[y][x] !== 'destructible') continue
+          if (snapshot.crates[y * GRID_WIDTH + x] === '1') continue
+          grid[y][x] = 'empty'
+          if (removeCrateAt(x, y)) removedAny = true
+        }
+      }
+      if (removedAny) refreshShadows()
     }
     if (snapshot.blasts.length > 0) {
       playRemoteBlast(snapshot.blasts)
@@ -6484,8 +6778,71 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     lastSnapshotAt = Date.now()
     lastFullSnapshotAt = lastSnapshotAt
 
-    const timer = setTimeout(() => net.send({ t: 'roundResult', winnerId }), ROUND_OVER_GRACE_MS)
-    scene.onDisposeObservable.add(() => clearTimeout(timer))
+    // Keep saying it until somebody acts on it.
+    //
+    // This is the one message in the protocol with nothing to fall back on. A
+    // round ends only because the host said so, and `send` is a silent no-op
+    // while the socket is down — so a single dropped `roundResult` stranded
+    // every client in a finished arena permanently: `roundReported` had already
+    // been set, so the host never tried again, and the server's abandonment
+    // path never fired either because the host was still there. A blip lasting
+    // one second, during the grace period, killed the match for good.
+    //
+    // Repeats are safe: the server ignores a result for a round that is no
+    // longer in progress, so at most one is ever scored. And the acknowledgement
+    // is free — `roundOver` tears this scene down, so disposal is precisely the
+    // signal that the message landed.
+    let retry: ReturnType<typeof setInterval> | null = null
+    const report = () => net.send({ t: 'roundResult', winnerId })
+    const timer = setTimeout(() => {
+      report()
+      retry = setInterval(report, ROUND_RESULT_RETRY_MS)
+    }, ROUND_OVER_GRACE_MS)
+
+    scene.onDisposeObservable.add(() => {
+      clearTimeout(timer)
+      if (retry) clearInterval(retry)
+    })
+  }
+
+  /**
+   * Describe the world to the guests, if there is anything to say. Host only.
+   *
+   * Blasts and crate removals are one-shot events, not state: they are carried
+   * by exactly one snapshot and are gone from the next. Waiting out the idle
+   * interval delays every remote explosion by up to a frame's worth of fuse, so
+   * anything to report goes as soon as the rate ceiling allows.
+   *
+   * A moved player or a new bomb counts as something to report for the same
+   * reason: those are what guests reconcile against, and holding them is dead
+   * time added to every correction — a bomb a guest has not heard about yet is
+   * a tile it will happily predict itself onto and then be pulled off.
+   *
+   * Called from the tick and again the moment a guest's input changes anything,
+   * because an input that arrives just after a tick would otherwise sit on the
+   * host, already simulated, while everybody else's screen still showed that
+   * player standing still.
+   */
+  function maybeSendSnapshot(): void {
+    if (!online || !online.isHost) return
+    const now = Date.now()
+    const sinceLast = now - lastSnapshotAt
+
+    // Taken once and handed on to buildSnapshot as the new baseline: it was
+    // being built twice per tick, once to decide whether to send and again to
+    // record what had been sent, with nothing able to change in between.
+    const world = worldFingerprint()
+    const hasNews =
+      pendingBlasts.length > 0 || pendingCleared.length > 0 || world !== lastSentWorld
+    if (hasNews ? sinceLast < MIN_SNAPSHOT_GAP_MS : sinceLast < SNAPSHOT_INTERVAL_MS) return
+
+    const full = forceFullSnapshot || now - lastFullSnapshotAt >= FULL_SNAPSHOT_INTERVAL_MS
+    if (full) {
+      lastFullSnapshotAt = now
+      forceFullSnapshot = false
+    }
+    lastSnapshotAt = now
+    online.net.send({ t: 'state', tick: now, payload: buildSnapshot(full, world) })
   }
 
   /**
@@ -6498,11 +6855,10 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    */
   function simulateOnlineTick(elapsedMs: number): void {
     if (!online || isPaused || gameOver) return
-    const now = Date.now()
     // Real elapsed time, not the nominal tick length.
     //
-    // A timer never fires exactly on its interval, so charging a flat 33ms per
-    // tick means each end grants movement time in its own lumps — and a lump is
+    // A timer never fires exactly on its interval, so charging a flat tick's
+    // worth means each end grants movement time in its own lumps — and a lump is
     // over half a step once Speed takes a tile down to 60ms. That is enough for
     // the two ends to disagree about whether a quick tap moved one tile or two,
     // every time, which no amount of reconciliation can smooth over because it
@@ -6513,9 +6869,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
     const local = localNetPlayer()
     const input = readLocalNetInput()
-    if (local) local.input = { ...input, bomb: input.bomb || local.input.bomb }
 
     if (online.isHost) {
+      // Only the host simulates, so only the host has any use for an input
+      // slot. Filling one in on a guest wrote a value nothing ever read and
+      // nothing ever cleared.
+      if (local) local.input = input
       for (const np of netPlayers) stepNetPlayer(np, stepMs)
 
       // Invulnerability flicker is the host's call, mirrored via the snapshot.
@@ -6541,18 +6900,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // is a tile it will happily predict itself onto and then be pulled off.
       // The tick bounds this at ~30Hz, and an idle arena still costs the old
       // 15Hz, so the extra traffic only appears while something is happening.
-      // Taken once and handed on to buildSnapshot as the new baseline: it was
-      // being built twice per tick, once to decide whether to send and again to
-      // record what had been sent, with nothing able to change in between.
-      const world = worldFingerprint()
-      const hasEvents =
-        pendingBlasts.length > 0 || pendingCleared.length > 0 || world !== lastSentWorld
-      if (hasEvents || now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS) {
-        const full = now - lastFullSnapshotAt >= FULL_SNAPSHOT_INTERVAL_MS
-        if (full) lastFullSnapshotAt = now
-        lastSnapshotAt = now
-        online.net.send({ t: 'state', tick: now, payload: buildSnapshot(full, world) })
-      }
+      maybeSendSnapshot()
     } else {
       // Safety net only — the frame loop normally does both of these, and does
       // them sooner. This catches the case where frames have stalled but the
@@ -6560,6 +6908,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // in a frame is harmless: the position is derived, not stepped.
       publishLocalInput(input)
       if (local && local.alive) deriveLocalPosition(local)
+
+      // Checked here rather than on the frame deliberately: this is the timer,
+      // and it keeps running when frames do not, which is exactly the case
+      // where a player most needs telling.
+      const since = Date.now() - lastSnapshotArrivedAt
+      setHostSilent(lastSnapshotArrivedAt > 0 && since > HOST_SILENCE_MS)
     }
   }
 
@@ -6600,6 +6954,11 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     // so what we re-derive is exactly what the host was told.
     sentInputs.push({ seq: localInputSeq, dx: input.dx, dy: input.dy, at: stampedAt })
     if (sentInputs.length > SENT_INPUT_HISTORY) sentInputs.shift()
+
+    // The one place a bomb request leaves this client, whichever of the tick or
+    // the frame happened to consume the keypress — so the prediction hangs off
+    // here rather than off either caller.
+    if (input.bomb) predictLocalBomb(localInputSeq)
   }
 
   /**
@@ -6699,6 +7058,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       const remaining = ((mesh as any)._fuseMs ?? 0) - deltaTime
       ;(mesh as any)._fuseMs = remaining
       animateBombVisuals(mesh, (mesh as any)._spark, (mesh as any)._dangerRing, remaining, id, now)
+    }
+    // Bombs asked for but not yet confirmed pulse exactly like the real thing —
+    // the point is that the player cannot tell which is which.
+    for (const predicted of predictedBombs) {
+      const mesh = predicted.mesh
+      const remaining = ((mesh as any)._fuseMs ?? 0) - deltaTime
+      ;(mesh as any)._fuseMs = remaining
+      animateBombVisuals(mesh, (mesh as any)._spark, (mesh as any)._dangerRing, remaining, predicted.seq, now)
     }
   }
 
@@ -6942,6 +7309,24 @@ const pauseMenu = createPauseMenu({
     ;(pauseMenu as any).collapseAudio?.()
     mainMenu.style.display = 'flex'
 
+    // Tell the server, if this was an online match.
+    //
+    // Quitting used to dispose the scene and nothing else, leaving the socket
+    // open and the seat occupied — so from the server's side this player was
+    // still connected and still in the round. That is worse than a crash: a
+    // dropped socket at least frees the seat after the grace period, whereas
+    // this stranded everyone else in a round that could never end and in a
+    // lobby that could never be reaped, because somebody was always "there".
+    // If the quitter was the host, that is every other player waiting on a
+    // simulation that no longer exists.
+    if (netClient.lobby) {
+      netClient.inMatch = false
+      netClient.leaveLobby()
+      netClient.disconnect()
+      ;(lobbyScreen as any).showChoice?.()
+      lobbyScreen.style.display = 'none'
+    }
+
     if (soundManager) soundManager.stopMusic()
     
     // Clean up game — dispose scene first, then engine (correct order for GPU resource cleanup)
@@ -7054,10 +7439,13 @@ const lobbyScreen = createLobbyScreen({
     if (!lobby || !netClient.youId) return
 
     lobbyScreen.style.display = 'none'
+    // An arena exists from here until teardownOnlineMatch takes it away. A
+    // reconnect in between is a blip to be picked up; one outside it is a page
+    // that has lost the match and has to be handed it again.
+    netClient.inMatch = true
     startGame('pvp', {
       net: netClient,
       seed: info.seed,
-      round: info.round,
       youId: netClient.youId,
       isHost: info.youAreHost,
       lives: lobby.config.lives,
@@ -7077,6 +7465,7 @@ const lobbyScreen = createLobbyScreen({
 
 /** Dispose the running online arena and its DOM furniture. */
 function teardownOnlineMatch(): void {
+  netClient.inMatch = false
   if (currentScene) {
     currentScene.dispose()
     currentScene = null
@@ -7088,7 +7477,7 @@ function teardownOnlineMatch(): void {
   if (soundManager) soundManager.stopMusic()
   document
     .querySelectorAll(
-      '.game-ui-panel, .center-ui, .mobile-controls-container, .offscreen-indicator, .game-pause-btn, #indicator-container, #game-over-overlay',
+      '.game-ui-panel, .center-ui, .mobile-controls-container, .offscreen-indicator, .game-pause-btn, .net-stall-banner, #indicator-container, #game-over-overlay',
     )
     .forEach(el => el.remove())
   isPaused = false

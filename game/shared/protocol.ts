@@ -15,7 +15,7 @@
  * half understands is worse than no match at all, because it looks like the
  * game working badly rather than like a stale tab.
  */
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 /** Lobby codes are always exactly this many digits, zero padded. */
 export const LOBBY_CODE_LENGTH = 6
@@ -112,6 +112,17 @@ export interface ResumeLobbyMessage {
   t: 'resume'
   code: string
   playerId: string
+  /**
+   * Whether this client still has the arena it left with.
+   *
+   * A dropped socket and a reloaded page look identical from the server, and
+   * they need opposite treatment: a blip should be picked up exactly where it
+   * left off, whereas a client that has lost its scene needs the match handed
+   * to it again — or, if it was the one simulating, needs the round called off,
+   * because the world it was the sole authority for no longer exists. Only the
+   * client knows which of the two happened, so it says.
+   */
+  inMatch: boolean
 }
 
 export interface SetReadyMessage {
@@ -393,6 +404,16 @@ export interface SnapshotBomb {
   /** Milliseconds left on the fuse, for the pulse animation. */
   timer: number
   blast: number
+  /**
+   * Slot of whoever laid it, or -1 for a bomb with no networked owner.
+   *
+   * Guests predict their own bomb placement, and the one thing that decides
+   * whether a press will be honoured is how many bombs that player already has
+   * out. Without an owner a guest cannot count its own, so it has to place
+   * hopefully and take the bomb away again when the host declines — which is a
+   * visible flicker at exactly the moment the player is trying to judge a gap.
+   */
+  owner: number
 }
 
 export interface SnapshotPowerUp {
@@ -415,6 +436,19 @@ export interface WorldSnapshot {
   blasts: Array<[number, number]>
   /** Crates destroyed since the last snapshot. */
   cleared: Array<[number, number]>
+  /**
+   * Which crates are still standing, as one character per tile, row by row.
+   *
+   * Sent with a full snapshot only. `cleared` is a one-shot event — carried by
+   * exactly one snapshot and gone from the next — so a guest that was away when
+   * it went out never learns that crate was destroyed, and there is nothing in
+   * the protocol that would ever mention it again. It then renders crates that
+   * are not there and, worse, predicts its own movement against them: it
+   * refuses to walk through a gap the host is happy to let it through, so every
+   * step near the mistake has to be corrected. Of everything a snapshot
+   * describes, the arena was the only part that was never restated.
+   */
+  crates?: string
   /**
    * True when nothing has been left out, so the receiver can rebuild from this
    * one message alone.

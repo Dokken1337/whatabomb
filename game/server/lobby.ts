@@ -32,6 +32,15 @@ export interface LobbyRecord {
   players: LobbyPlayer[]
   createdAt: number
   updatedAt: number
+  /**
+   * Map seed for the round in progress.
+   *
+   * Kept on the record rather than only announced, because a client that
+   * reloads mid-match has to be told which arena everyone else is standing in.
+   * When this was a local in the start handler there was no way to answer that,
+   * so a refresh meant sitting in the lobby until the round ended.
+   */
+  seed: number
 }
 
 /**
@@ -77,6 +86,7 @@ export function createLobby(code: string, hostName: unknown): LobbyRecord {
     players: [host],
     createdAt: now,
     updatedAt: now,
+    seed: 0,
   }
 }
 
@@ -112,22 +122,43 @@ export function addPlayer(lobby: LobbyRecord, name: unknown): LobbyPlayer {
   return player
 }
 
-export function removePlayer(lobby: LobbyRecord, playerId: string): void {
+export interface RemovalOutcome {
+  /**
+   * A round was in progress and cannot be finished.
+   *
+   * Callers must tell the clients, not just update the roster. Play is
+   * host-authoritative, so an arena whose round has been abandoned goes on
+   * looking perfectly alive on every screen — nothing in it knows the round is
+   * over, because rounds only ever end when the server says so. Left unsaid,
+   * the players sit in a world that has stopped and eventually close the tab.
+   */
+  roundAbandoned: boolean
+}
+
+export function removePlayer(lobby: LobbyRecord, playerId: string): RemovalOutcome {
   const index = lobby.players.findIndex(p => p.id === playerId)
-  if (index === -1) return
+  if (index === -1) return { roundAbandoned: false }
+
+  const wasPlaying = lobby.status === 'playing'
+  const wasHost = lobby.hostId === playerId
+
   lobby.players.splice(index, 1)
   lobby.updatedAt = Date.now()
 
   // Hand the host role to whoever has been waiting longest.
-  if (lobby.hostId === playerId && lobby.players.length > 0) {
+  if (wasHost && lobby.players.length > 0) {
     lobby.hostId = lobby.players[0].id
   }
 
-  // A match cannot continue below the minimum, so send everyone back to the lobby.
-  if (lobby.status === 'playing' && countActive(lobby) < MIN_PLAYERS) {
-    lobby.status = 'waiting'
-    resetReadyFlags(lobby)
-  }
+  // Two ways a round stops being playable: too few players left for a match,
+  // or the loss of the one client that was simulating it. The promoted host
+  // cannot simply pick the round up — guests only ever received snapshots, so
+  // nobody else is holding the fuses, the ownership of each bomb or the blast
+  // radii needed to carry on faithfully. Restarting the round is the honest
+  // outcome, and it is why nobody is credited with winning it.
+  const roundAbandoned = wasPlaying && (wasHost || countActive(lobby) < MIN_PLAYERS)
+  if (roundAbandoned) abandonRound(lobby)
+  return { roundAbandoned }
 }
 
 export function findPlayer(lobby: LobbyRecord, playerId: string): LobbyPlayer | undefined {
@@ -177,8 +208,22 @@ export function canStart(lobby: LobbyRecord): boolean {
   return startBlockedReason(lobby) === null
 }
 
-export function beginRound(lobby: LobbyRecord): void {
+export function beginRound(lobby: LobbyRecord, seed: number): void {
   lobby.status = 'playing'
+  lobby.seed = seed
+  lobby.updatedAt = Date.now()
+}
+
+/**
+ * Call off the round in progress without crediting anyone.
+ *
+ * Used whenever the simulation is gone rather than finished — the host left, or
+ * came back without the world it was holding. The round is replayed, so no
+ * score changes hands.
+ */
+export function abandonRound(lobby: LobbyRecord): void {
+  lobby.status = 'waiting'
+  resetReadyFlags(lobby)
   lobby.updatedAt = Date.now()
 }
 

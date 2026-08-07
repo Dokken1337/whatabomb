@@ -13,7 +13,20 @@ export interface RelayEnvelope {
   code: string
   /** Player ids to deliver to, or null for everyone seated in the lobby. */
   to: string[] | null
-  message: ServerMessage
+  message?: ServerMessage
+  /**
+   * Close any socket still holding this seat, other than the one that has just
+   * claimed it.
+   *
+   * A seat belongs to one socket. Enforcing that locally is not enough once
+   * there is more than one instance: a client that reconnects onto a different
+   * one leaves the original still seated, so every message addressed to that
+   * player is written twice and every input it sends is relayed twice, until
+   * the heartbeat reaps the stale socket up to a heartbeat-timeout later.
+   * Eviction has to reach wherever the old socket actually is, and the relay is
+   * already the thing that reaches everywhere.
+   */
+  evictSeat?: { playerId: string; exceptConnectionId: string }
 }
 
 /** Hands an envelope to whichever local sockets it is addressed to. */
@@ -63,7 +76,8 @@ export async function createRedisRelay(
       console.error('[relay] dropping unparseable envelope')
       return
     }
-    if (!envelope || typeof envelope.code !== 'string' || !envelope.message) return
+    if (!envelope || typeof envelope.code !== 'string') return
+    if (!envelope.message && !envelope.evictSeat) return
     try {
       deliver(envelope)
     } catch (err) {

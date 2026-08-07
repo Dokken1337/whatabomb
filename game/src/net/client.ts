@@ -70,6 +70,15 @@ export class NetClient {
   youId: string | null = null
   /** Last lobby snapshot received, for UI that renders on demand. */
   lobby: LobbyView | null = null
+  /**
+   * Whether an arena is currently built and running in this page.
+   *
+   * Sent with a resume so the server can tell a dropped socket from a reloaded
+   * page — indistinguishable from its side, and needing opposite treatment.
+   * Set by whoever owns the match lifecycle; false is the safe default, since
+   * a fresh page has no arena by definition.
+   */
+  inMatch = false
 
   private url: string
 
@@ -123,7 +132,12 @@ export class NetClient {
         // Reclaim the seat before anything else, so gameplay traffic that
         // arrives immediately after is attributed to the right player.
         if (this.resumeAs) {
-          this.send({ t: 'resume', code: this.resumeAs.code, playerId: this.resumeAs.playerId })
+          this.send({
+            t: 'resume',
+            code: this.resumeAs.code,
+            playerId: this.resumeAs.playerId,
+            inMatch: this.inMatch,
+          })
         }
         // Keeps intermediaries from dropping an idle socket.
         this.pingTimer = setInterval(() => {

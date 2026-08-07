@@ -1,7 +1,7 @@
 import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import { randomInt } from 'node:crypto'
+import { randomInt, randomUUID } from 'node:crypto'
 import express from 'express'
 import { WebSocketServer, WebSocket } from 'ws'
 
@@ -26,6 +26,7 @@ import { createLocalRelay, createRedisRelay, type Relay, type RelayEnvelope } fr
 import {
   IDLE_LOBBY_TTL_MS,
   LobbyFullError,
+  abandonRound,
   LobbyInProgressError,
   addPlayer,
   beginRound,
@@ -112,6 +113,8 @@ const server = createServer(app)
 
 interface Connection {
   socket: WebSocket
+  /** Unique across the cluster, so an eviction can spare the socket that sent it. */
+  id: string
   playerId: string | null
   lobbyCode: string | null
   lastSeen: number
@@ -137,6 +140,7 @@ const lobbyConnections = new Map<string, Set<Connection>>()
 /** Seat a connection in a lobby, keeping the index in step. */
 function seatConnection(connection: Connection, code: string, playerId: string): void {
   unseatConnection(connection)
+
   connection.lobbyCode = code
   connection.playerId = playerId
   let seated = lobbyConnections.get(code)
@@ -145,6 +149,34 @@ function seatConnection(connection: Connection, code: string, playerId: string):
     lobbyConnections.set(code, seated)
   }
   seated.add(connection)
+
+  // One socket per seat, wherever the other one is.
+  //
+  // A client that reconnects before the heartbeat has reaped its old socket
+  // would otherwise hold the seat twice: every message addressed to that player
+  // is written to both, and every input it sends is relayed twice. The host
+  // drops duplicate inputs by sequence number so nothing breaks outright, which
+  // is precisely why this went unnoticed — it quietly doubled that player's
+  // traffic for up to a heartbeat timeout, and left it ambiguous which socket a
+  // later disconnect was vacating.
+  //
+  // Sent through the relay rather than done inline because the stale socket is
+  // not necessarily on this instance: a reconnect can land anywhere behind the
+  // load balancer, and that is exactly the case a local sweep cannot reach.
+  // Seating first means the envelope, which comes straight back to us, finds
+  // this connection already in place to be spared.
+  relay.publish({ code, to: null, evictSeat: { playerId, exceptConnectionId: connection.id } })
+}
+
+/** Close any socket holding `playerId` in `code`, except the named one. */
+function evictSeat(code: string, playerId: string, exceptConnectionId: string): void {
+  const seated = lobbyConnections.get(code)
+  if (!seated) return
+  for (const other of [...seated]) {
+    if (other.id === exceptConnectionId || other.playerId !== playerId) continue
+    unseatConnection(other)
+    other.socket.close(4000, 'Seat reclaimed by a newer connection')
+  }
 }
 
 /** Take a connection out of whatever lobby it was in. Safe to call twice. */
@@ -243,6 +275,13 @@ async function matchContext(connection: Connection): Promise<MatchContext | null
 
 /** Deliver a relayed envelope to whichever of its addressees are local. */
 function deliverLocally(envelope: RelayEnvelope): void {
+  if (envelope.evictSeat) {
+    const { playerId, exceptConnectionId } = envelope.evictSeat
+    evictSeat(envelope.code, playerId, exceptConnectionId)
+    return
+  }
+  if (!envelope.message) return
+
   // Every instance sees every envelope, so all of them keep an accurate roster
   // even for lobbies they currently hold no sockets for.
   const carried = (envelope.message as { lobby?: LobbyView }).lobby
@@ -333,6 +372,7 @@ function overRateLimit(connection: Connection): boolean {
 wss.on('connection', socket => {
   const connection: Connection = {
     socket,
+    id: randomUUID(),
     playerId: null,
     lobbyCode: null,
     lastSeen: Date.now(),
@@ -492,6 +532,12 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         return
       }
 
+      // A client that still has its arena is simply picking up where it left
+      // off. One that has lost it — a reload, or a phone that evicted the tab —
+      // needs more than its seat back, and what it needs depends on whether it
+      // was the one simulating.
+      const lostTheArena = message.inMatch === false
+
       const resumed = await store.withLock(message.code, async () => {
         const lobby = await store.get(message.code)
         if (!lobby) return null
@@ -500,8 +546,17 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
 
         player.connected = true
         player.disconnectedAt = null
+
+        // The host coming back without the world it was the sole authority for
+        // cannot resume the round: nobody else was ever holding the fuses or
+        // the bomb ownership. Calling it off is the only honest option, and it
+        // beats the alternative that used to happen — every client sitting in
+        // an arena whose simulation had quietly ceased to exist.
+        const abandoned = lostTheArena && lobby.status === 'playing' && lobby.hostId === player.id
+        if (abandoned) abandonRound(lobby)
+
         await store.set(lobby.code, lobby)
-        return lobby
+        return { lobby, abandoned }
       })
 
       if (!resumed) {
@@ -511,9 +566,27 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         return
       }
 
-      seatConnection(connection, resumed.code, message.playerId)
-      send(socket, { t: 'joined', youId: message.playerId, lobby: toView(resumed) })
-      broadcastLobby(resumed)
+      const { lobby: resumedLobby, abandoned } = resumed
+      seatConnection(connection, resumedLobby.code, message.playerId)
+      send(socket, { t: 'joined', youId: message.playerId, lobby: toView(resumedLobby) })
+
+      // A guest that lost its arena gets the match handed to it again. The seed
+      // rebuilds the same board, and the host's snapshots fill in everything
+      // that has happened since — including, now that a full snapshot restates
+      // the crate layout, the parts of the arena that were blown up while it
+      // was away.
+      if (lostTheArena && !abandoned && resumedLobby.status === 'playing') {
+        send(socket, {
+          t: 'matchStart',
+          seed: resumedLobby.seed,
+          round: resumedLobby.round,
+          hostId: resumedLobby.hostId,
+          lobby: toView(resumedLobby),
+        })
+      }
+
+      if (abandoned) endAbandonedRound(resumedLobby)
+      broadcastLobby(resumedLobby)
       return
     }
 
@@ -556,7 +629,9 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         return
       }
       const playerId = connection.playerId
-      // One seed for everyone so all clients generate an identical arena.
+      // One seed for everyone so all clients generate an identical arena. Kept
+      // on the lobby record too, so a client that reloads can be told which
+      // arena to rebuild.
       const seed = randomInt(0, 2 ** 31 - 1)
 
       type StartOutcome =
@@ -571,6 +646,21 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         if (lobby.hostId !== playerId) {
           return { ok: false, code: 'not_host', reason: 'Only the host can start the match' }
         }
+        // Anyone not here when it starts is not in it.
+        //
+        // Every start rule already counts only the connected, so a lobby could
+        // legitimately start while a seat was being held for someone mid-blip —
+        // and the clients build their arena from the connected players too, so
+        // that seat existed on the server and nowhere else. If its owner then
+        // reconnected mid-round their inputs reached a host with no character
+        // to apply them to: a player seated in a match they could not see, play
+        // or leave until the round ended. Freeing the seat here keeps the
+        // roster the clients build and the seats the server holds the same
+        // list, which is the property everything downstream assumes.
+        for (const player of [...lobby.players]) {
+          if (!player.connected) removePlayer(lobby, player.id)
+        }
+
         if (!canStart(lobby)) {
           return {
             ok: false,
@@ -578,7 +668,7 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
             reason: startBlockedReason(lobby) ?? 'Cannot start yet',
           }
         }
-        beginRound(lobby)
+        beginRound(lobby, seed)
         await store.set(lobby.code, lobby)
         return { ok: true, lobby }
       })
@@ -666,15 +756,16 @@ async function releaseSeat(
   playerId: string,
   options: { immediate?: boolean } = {},
 ): Promise<void> {
-  const lobby = await store.withLock(code, async () => {
+  const result = await store.withLock(code, async () => {
     const current = await store.get(code)
     if (!current) return null
 
     const player = findPlayer(current, playerId)
     if (!player) return null
 
+    let roundAbandoned = false
     if (options.immediate) {
-      removePlayer(current, playerId)
+      roundAbandoned = removePlayer(current, playerId).roundAbandoned
     } else {
       // Hold the seat briefly so a refresh or flaky connection does not end a match.
       player.connected = false
@@ -689,11 +780,29 @@ async function releaseSeat(
     }
 
     await store.set(code, current)
-    return current
+    return { lobby: current, roundAbandoned }
   })
 
-  if (!lobby) return
-  broadcastLobby(lobby)
+  if (!result) return
+  if (result.roundAbandoned) endAbandonedRound(result.lobby)
+  broadcastLobby(result.lobby)
+}
+
+/**
+ * Tell everyone a round they are still playing has been called off.
+ *
+ * Shaped as an ordinary `roundOver` with nobody winning, so clients need no
+ * special case: they already tear the arena down and return to the lobby on
+ * one, which is exactly the right thing to do here. Scoring is untouched — an
+ * abandoned round is replayed rather than awarded.
+ */
+function endAbandonedRound(lobby: LobbyRecord): void {
+  relayTo(lobby.code, null, {
+    t: 'roundOver',
+    winnerId: null,
+    lobby: toView(lobby),
+    matchWinnerId: null,
+  })
 }
 
 // ── Housekeeping ─────────────────────────────────────────────────────────────
@@ -747,13 +856,14 @@ const sweep = setInterval(() => {
         if (!lobby) return null
 
         let rosterChanged = false
+        let roundAbandoned = false
         for (const player of [...lobby.players]) {
           if (
             !player.connected &&
             player.disconnectedAt !== null &&
             now - player.disconnectedAt > RECONNECT_GRACE_MS
           ) {
-            removePlayer(lobby, player.id)
+            roundAbandoned = removePlayer(lobby, player.id).roundAbandoned || roundAbandoned
             rosterChanged = true
           }
         }
@@ -773,12 +883,21 @@ const sweep = setInterval(() => {
         if (occupied) lobby.updatedAt = now
 
         await store.set(lobby.code, lobby)
-        return { lobby, rosterChanged }
+        return { lobby, rosterChanged, roundAbandoned }
       })
 
-      if (result?.rosterChanged) broadcastLobby(result.lobby)
+      if (!result?.rosterChanged) continue
+      if (result.roundAbandoned) endAbandonedRound(result.lobby)
+      broadcastLobby(result.lobby)
     }
-  })()
+  })().catch(err => {
+    // A sweep that throws must not take the process with it. Every read here
+    // goes to the shared store, so a Redis blip lands as a rejected promise on
+    // a timer with nobody awaiting it — which Node treats as fatal, killing an
+    // instance and every match on it over a housekeeping pass that could
+    // simply have run again in fifteen seconds.
+    console.error('[whatabomb] lobby sweep failed', err)
+  })
 }, 15_000)
 
 server.listen(port, () => {

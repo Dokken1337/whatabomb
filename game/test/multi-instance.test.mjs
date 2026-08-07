@@ -199,6 +199,34 @@ test('an addressed message is delivered to every instance for filtering', async 
   assert.equal(seen[0].message.playerId, 'guest-id')
 })
 
+test('a seat claimed on one instance is evicted on the other', async () => {
+  // The case this exists for: a client reconnects and the load balancer sends
+  // it to a different instance from the one holding its old socket. Evicting
+  // locally cannot reach that socket, so both instances kept the seat and every
+  // message addressed to that player was written twice — including snapshots,
+  // whose one-shot blast events then detonated the same bomb twice on screen.
+  const redis = createFakeRedis()
+  const seenByA = []
+  const seenByB = []
+
+  const relayA = await createRedisRelay(redis, redis, env => seenByA.push(env))
+  await createRedisRelay(redis, redis, env => seenByB.push(env))
+
+  relayA.publish({
+    code: '565656',
+    to: null,
+    evictSeat: { playerId: 'player-1', exceptConnectionId: 'conn-new' },
+  })
+  await tick()
+
+  assert.equal(seenByB.length, 1, 'the eviction never reached the other instance')
+  assert.deepEqual(seenByB[0].evictSeat, { playerId: 'player-1', exceptConnectionId: 'conn-new' })
+  assert.equal(seenByB[0].message, undefined, 'an eviction carries no client message')
+  // And it comes back to the publisher too, which is how the local case is
+  // served by the same path rather than by a second copy of the rule.
+  assert.equal(seenByA.length, 1)
+})
+
 test('a malformed envelope does not take the relay down', async () => {
   const redis = createFakeRedis()
   const seen = []

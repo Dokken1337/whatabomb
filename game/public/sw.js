@@ -1,5 +1,11 @@
 // Bumped per release so the activate handler drops the previous cache.
-const CACHE_NAME = 'whatabomb-v1-18-0'
+//
+// Keep this in step with package.json. It was left on 1.18.0 through the 1.19.0
+// release, which now matters more than it used to: the client checks the wire
+// protocol version on connect and refuses to play a mismatch, so a stale shell
+// served from this cache is the difference between playing and being told to
+// reload.
+const CACHE_NAME = 'whatabomb-v1-20-0'
 const PRECACHE_URLS = [
   './',
   './index.html',
