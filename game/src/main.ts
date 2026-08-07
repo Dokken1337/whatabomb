@@ -50,7 +50,12 @@ import {
 import { generateMap, type SpawnPoint } from './map-gen'
 import { NetClient } from './net/client'
 import { createLobbyScreen } from './net/lobby-screen'
-import type { SnapshotPlayer, WorldSnapshot } from '../shared/protocol'
+import {
+  playerStatsSignature,
+  type SnapshotPlayer,
+  type SnapshotPlayerStats,
+  type WorldSnapshot,
+} from '../shared/protocol'
 import {
   accrue,
   appendWaypoints,
@@ -2206,6 +2211,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   const localNetPlayer = (): NetPlayer | undefined => netPlayers.find(p => p.isLocal)
   const netPlayerById = (id: string): NetPlayer | undefined => netPlayers.find(p => p.id === id)
+  /** Snapshots identify players by slot — one digit rather than a UUID. */
+  const netPlayerBySlot = (slot: number): NetPlayer | undefined =>
+    netPlayers.find(p => p.slot === slot)
   /** Bomb ownerId encoding for a networked player; offline ids stay negative. */
   const netOwnerId = (slot: number) => 1000 + slot
   const netPlayerByOwnerId = (ownerId: number): NetPlayer | undefined =>
@@ -5122,14 +5130,43 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     keysHeld.delete(ev.key)
     keyPressTime.delete(ev.key)
   }
-  
+
+  /**
+   * Let go of everything when the window stops receiving keys.
+   *
+   * A key held while the window loses focus never gets its keyup: the event
+   * goes wherever the focus went. The character therefore keeps walking on a
+   * direction nobody is holding any more — offline until you come back, and
+   * online for as long as you are away, because a guest only tells the host
+   * when its input *changes* and from the host's side nothing has.
+   *
+   * That is where the reports of a player "sliding off on their own" after
+   * alt-tabbing came from. Online the release is published straight away
+   * rather than waiting for the next tick, since a hidden tab's timers are
+   * throttled to about once a second and that is a long way to walk.
+   */
+  const releaseHeldKeys = () => {
+    if (keysHeld.size === 0) return
+    keysHeld.clear()
+    keyPressTime.clear()
+    if (online && !online.isHost) publishLocalInput({ dx: 0, dy: 0, bomb: false })
+  }
+  const blurHandler = () => releaseHeldKeys()
+  const visibilityHandler = () => {
+    if (document.hidden) releaseHeldKeys()
+  }
+
   window.addEventListener('keydown', keydownHandler)
   window.addEventListener('keyup', keyupHandler)
-  
+  window.addEventListener('blur', blurHandler)
+  document.addEventListener('visibilitychange', visibilityHandler)
+
   // Clean up event listeners when scene is disposed
   scene.onDisposeObservable.add(() => {
     window.removeEventListener('keydown', keydownHandler)
     window.removeEventListener('keyup', keyupHandler)
+    window.removeEventListener('blur', blurHandler)
+    document.removeEventListener('visibilitychange', visibilityHandler)
   })
 
   // Off-screen indicators
@@ -5295,6 +5332,38 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     const previous = (online.net as any).handlers
     online.net.setHandlers({
       ...previous,
+      onLobby: lobby => {
+        previous?.onLobby?.(lobby)
+        if (!online.isHost) return
+        // Stop simulating someone who is no longer there.
+        //
+        // A held direction stands until the player says otherwise, and a player
+        // whose socket has dropped never will — so the host walked them on
+        // until they hit a wall, and everyone watched a disconnected character
+        // stroll across the arena. Their seat is held for the grace period, so
+        // this is a pause rather than a removal: zeroing the input is enough,
+        // and leaving their movement clock alone is what lets settleHeldDirection
+        // treat their return as a fresh press.
+        for (const seat of lobby.players) {
+          if (seat.connected) continue
+          const np = netPlayerById(seat.id)
+          if (!np || np.isLocal) continue
+          np.input = { dx: 0, dy: 0, bomb: false }
+        }
+      },
+      onState: state => {
+        previous?.onState?.(state)
+        if (state !== 'open' || online.isHost) return
+        // Coming back from a drop, nothing we predicted across the gap is worth
+        // keeping. The inputs still in the buffer are stamped from before it,
+        // and replaying them against whatever the host says next would spend
+        // the whole outage walking. Start again from the host's next word, and
+        // clear the last-sent signature so the direction actually being held is
+        // published rather than suppressed as unchanged.
+        sentInputs.length = 0
+        localAuthoritative = null
+        lastSentInput = ''
+      },
       onRelayInput: msg => {
         // Host only: fold a guest's input into their player slot.
         const np = netPlayerById(msg.playerId)
@@ -5327,6 +5396,7 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
         // hold it so our next input can hand it straight back and let the host
         // time the round trip without either of us reading the other's clock.
         lastAppliedTick = msg.tick
+        observeSnapshotArrival(Date.now())
         applySnapshot(msg.payload as WorldSnapshot)
       },
     })
@@ -5374,9 +5444,9 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   let lastSentInput = ''
   let lastSnapshotAt = 0
+  /** When the last snapshot carrying everything went out. Host only. */
+  let lastFullSnapshotAt = 0
   let roundReported = false
-  /** Fingerprint of the last HUD state a guest drew. See hudSignature. */
-  let lastHudSignature = ''
   /**
    * Inputs this guest has sent, newest last, with their own clock stamps.
    *
@@ -5387,17 +5457,6 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
   const sentInputs: TimedInput[] = []
   /** How many inputs to remember. A couple of seconds of play at any speed. */
   const SENT_INPUT_HISTORY = 64
-  /**
-   * Round trip to the host, measured off our own inputs.
-   *
-   * Reconciliation no longer needs it — replay re-derives the position rather
-   * than reasoning about how far behind the host is entitled to be — but it is
-   * measured from traffic already flowing (we know when input N went out, and a
-   * snapshot acking N closes the loop) and it is what the HUD reports.
-   */
-  let rttEstimate = 250
-  /** When each input went out, so an ack can be turned into a round trip. */
-  const inputSentAt = new Map<number, number>()
   /** `tick` of that snapshot — the host's clock, echoed back with our input. */
   let lastAppliedTick = 0
   /**
@@ -5426,6 +5485,15 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   const SNAPSHOT_INTERVAL_MS = 66 // ~15Hz
   const ONLINE_TICK_MS = 33 // ~30Hz simulation, independent of frame rate
+  /**
+   * How often a snapshot carries everything rather than only what changed.
+   *
+   * Cheap insurance against a receiver being permanently wrong: a guest that
+   * reconnected mid-round missed whichever snapshot last described the
+   * loadouts, and nothing else would ever mention them again. One a second
+   * bounds how long anyone can be out of date.
+   */
+  const FULL_SNAPSHOT_INTERVAL_MS = 1000
   /** How long the host lets the final explosion play before ending the round. */
   const ROUND_OVER_GRACE_MS = 1300
 
@@ -5506,11 +5574,46 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * How far behind the newest report other players are drawn.
    *
    * Buys a known position on either side of whatever moment is on screen, which
-   * is what makes their movement an interpolation instead of a pursuit. Wide
-   * enough to swallow a couple of snapshot intervals of jitter; every millisecond
-   * beyond that is just added delay, so it is not generous for its own sake.
+   * is what makes their movement an interpolation instead of a pursuit.
+   *
+   * Measured rather than fixed, because the right amount is a property of the
+   * connection and not of the game. Too small and the buffer runs dry between
+   * reports, which is the one thing this scheme cannot hide: with nothing ahead
+   * of the moment being drawn there is nothing to interpolate toward, so remote
+   * players stand still and then jump. Too large and everyone is simply shown
+   * further in the past than they need to be. A fixed 100ms was both at once —
+   * dry on a jittery phone connection, needlessly stale on a good one.
+   *
+   * The measurement is the widest recent gap between snapshots rather than the
+   * average, because it is the worst gap that empties the buffer. It decays, so
+   * one bad moment does not cost delay for the rest of the match.
    */
-  const INTERP_DELAY_MS = 100
+  const INTERP_DELAY_MIN_MS = 60
+  const INTERP_DELAY_MAX_MS = 250
+  /** Headroom over the observed gap, so an averagely bad gap is still covered. */
+  const INTERP_DELAY_SLACK = 1.5
+  /** Per-second decay of the observed worst gap. */
+  const INTERP_GAP_DECAY = 0.5
+
+  let interpDelayMs = INTERP_DELAY_MIN_MS
+  let worstSnapshotGapMs = INTERP_DELAY_MIN_MS
+  let lastSnapshotArrivedAt = 0
+
+  /** Fold one snapshot's arrival into the interpolation delay. Guests only. */
+  function observeSnapshotArrival(arrivedAt: number): void {
+    if (lastSnapshotArrivedAt > 0) {
+      const gap = arrivedAt - lastSnapshotArrivedAt
+      // Decay first, so a settled connection walks the delay back down.
+      const elapsedSeconds = gap / 1000
+      worstSnapshotGapMs *= Math.pow(INTERP_GAP_DECAY, elapsedSeconds)
+      worstSnapshotGapMs = Math.max(worstSnapshotGapMs, Math.min(gap, INTERP_DELAY_MAX_MS))
+      interpDelayMs = Math.min(
+        INTERP_DELAY_MAX_MS,
+        Math.max(INTERP_DELAY_MIN_MS, worstSnapshotGapMs * INTERP_DELAY_SLACK),
+      )
+    }
+    lastSnapshotArrivedAt = arrivedAt
+  }
 
   /**
    * Draw a player this client does not predict, a fixed moment in the past.
@@ -5519,6 +5622,19 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * only makes the delay steady rather than varying with whenever the last
    * report happened to land, and it is the variation that reads as stutter.
    */
+  /**
+   * Run a guest's copy of the ghost clock down between the stats that carry it.
+   *
+   * Only acts while there is ghost left, so it restores full visibility exactly
+   * once and then leaves the mesh alone — the alive/dead visibility applied
+   * from the snapshot is not fought over.
+   */
+  function updateGuestGhost(np: NetPlayer, deltaTime: number): void {
+    if (np.ghostTimer <= 0) return
+    np.ghostTimer = Math.max(0, np.ghostTimer - deltaTime)
+    if (np.alive) setCharacterVisibility(np.mesh, np.ghostTimer > 0 ? 0.5 : 1)
+  }
+
   function drawReportedPlayer(np: NetPlayer, drawAt: number): void {
     pruneWaypoints(np.visualBuffer, drawAt)
     const seen = sampleAt(np.visualBuffer, drawAt)
@@ -5910,71 +6026,102 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     return sig
   }
 
-  /** Host only: has anything a guest predicts against moved since we last sent? */
-  function worldChangedSinceSnapshot(): boolean {
-    return worldFingerprint() !== lastSentWorld
+  /** The cold half of a player — see SnapshotPlayerStats. */
+  function statsFor(p: NetPlayer): SnapshotPlayerStats {
+    return {
+      lives: p.lives,
+      invulnerable: p.invulnerable,
+      bombs: p.maxBombs,
+      blast: p.blastRadius,
+      speed: p.speed,
+      kick: p.hasKick,
+      throwing: p.hasThrow,
+      shield: p.shieldCharges,
+      pierce: p.hasPierce,
+      ghost: Math.round(p.ghostTimer),
+      powerBomb: p.powerBombCharges,
+      lineBomb: p.hasLineBomb,
+    }
   }
 
-  function buildSnapshot(): WorldSnapshot {
-    lastSentWorld = worldFingerprint()
-    const snapshot: WorldSnapshot = {
-      players: netPlayers.map(p => ({
-        id: p.id,
+  /**
+   * Whether a loadout has anything new to say — see playerStatsSignature.
+   *
+   * The same rule serves the host's decision to resend and a guest's decision
+   * to rebuild the HUD, which is the same question asked from the two ends.
+   */
+  const statsSignature = (p: NetPlayer) => playerStatsSignature(statsFor(p))
+
+  /** Loadout as last put on the wire, keyed by slot, so it can be left off. */
+  const lastStatsSent = new Map<number, string>()
+  /** Power-up layout as last put on the wire. */
+  let lastPowerUpsSent = ''
+
+  /**
+   * Two decimals, so a float does not serialise as seventeen significant digits
+   * on every player on every snapshot. Far below the resolution any of this is
+   * felt at: the fastest a player can cross a tile is 90ms.
+   */
+  const round2 = (value: number) => Math.round(value * 100) / 100
+
+  /**
+   * Describe the world for the guests.
+   *
+   * `full` forces everything in, changed or not. Everything omitted is omitted
+   * on the assumption the receiver was told once and still knows, which is true
+   * of a guest that has been connected throughout and false of one that has
+   * just reconnected — so the host says everything once a second regardless.
+   */
+  function buildSnapshot(full: boolean, world = worldFingerprint()): WorldSnapshot {
+    lastSentWorld = world
+
+    const players = netPlayers.map(p => {
+      const entry: SnapshotPlayer = {
+        slot: p.slot,
         x: p.x,
         y: p.y,
-        lives: p.lives,
         alive: p.alive,
         dx: p.lastDx,
         dy: p.lastDy,
         // Held direction, not facing: facing never returns to zero, so it can
         // only say which way someone is pointing, never whether they are walking.
         moving: p.alive && (p.input.dx !== 0 || p.input.dy !== 0),
-        invulnerable: p.invulnerable,
-        bombs: p.maxBombs,
-        blast: p.blastRadius,
-        speed: p.speed,
-        kick: p.hasKick,
-        throwing: p.hasThrow,
-        shield: p.shieldCharges,
-        pierce: p.hasPierce,
-        ghost: p.ghostTimer,
-        powerBomb: p.powerBombCharges,
-        lineBomb: p.hasLineBomb,
         ackSeq: p.inputSeq,
-        credit: p.moveCredit,
+        credit: round2(p.moveCredit),
         // Where this player's own clock had got to when we last simulated them.
         // Their input stamps told us; handing it back is what lets them replay
         // exactly the span we have not covered. Meaningless for the host's own
         // player, which never replays anything.
-        simAt: (p.lastInputAt ?? 0) + p.creditedSinceInput,
+        simAt: round2((p.lastInputAt ?? 0) + p.creditedSinceInput),
+      }
+
+      const signature = statsSignature(p)
+      if (full || lastStatsSent.get(p.slot) !== signature) {
+        lastStatsSent.set(p.slot, signature)
+        entry.stats = statsFor(p)
+      }
+      return entry
+    })
+
+    const powerUpSignature = powerUps.map(p => `${p.x},${p.y},${p.type}`).join(';')
+    const sendPowerUps = full || powerUpSignature !== lastPowerUpsSent
+    if (sendPowerUps) lastPowerUpsSent = powerUpSignature
+
+    const snapshot: WorldSnapshot = {
+      players,
+      bombs: bombs.map(b => ({
+        id: b.id,
+        x: b.x,
+        y: b.y,
+        timer: Math.round(b.timer),
+        blast: b.blastRadius,
       })),
-      bombs: bombs.map(b => ({ id: b.id, x: b.x, y: b.y, timer: b.timer, blast: b.blastRadius })),
-      powerUps: powerUps.map(p => ({ x: p.x, y: p.y, type: p.type })),
       blasts: pendingBlasts.splice(0),
       cleared: pendingCleared.splice(0),
     }
+    if (sendPowerUps) snapshot.powerUps = powerUps.map(p => ({ x: p.x, y: p.y, type: p.type }))
+    if (full) snapshot.full = true
     return snapshot
-  }
-
-  /**
-   * Fingerprint of everything the HUD actually draws.
-   *
-   * applySnapshot used to mark the UI dirty on every snapshot, which put a full
-   * innerHTML rebuild of both panels — health bars, a dozen emoji power-up tiles
-   * and the whole roster — on very nearly every frame. Fifteen-plus DOM rebuilds
-   * a second is a cost the host never pays, because it only marks the UI dirty
-   * when something really changed, and it is a large part of why guests felt
-   * heavy on phones. Ghost is rounded to the second it is displayed at, so its
-   * countdown does not defeat the whole comparison.
-   */
-  function hudSignature(snapshot: WorldSnapshot): string {
-    let sig = ''
-    for (const sp of snapshot.players) {
-      sig += `${sp.lives},${sp.alive ? 1 : 0},${sp.bombs},${sp.blast},${sp.speed},` +
-        `${sp.kick ? 1 : 0}${sp.throwing ? 1 : 0}${sp.pierce ? 1 : 0}${sp.lineBomb ? 1 : 0},` +
-        `${sp.shield},${sp.powerBomb},${Math.ceil(sp.ghost / 1000)};`
-    }
-    return sig
   }
 
   /**
@@ -6005,17 +6152,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
    * rule this depends on is unit tested.
    */
   function reconcileLocal(np: NetPlayer, sp: SnapshotPlayer): void {
-    const now = Date.now()
-
-    // Close the loop on any input this snapshot acknowledges. Smoothed, because
-    // a single late sample should not swing the estimate around.
-    const sentAt = inputSentAt.get(sp.ackSeq)
-    if (sentAt !== undefined) {
-      rttEstimate = rttEstimate * 0.7 + (now - sentAt) * 0.3
-    }
-    for (const seq of [...inputSentAt.keys()]) {
-      if (seq <= sp.ackSeq) inputSentAt.delete(seq)
-    }
+    // Drop inputs the host has folded in. Replay ignores them anyway — it
+    // clips every span to what the host has not simulated — so this is only
+    // housekeeping, but without it the buffer is trimmed by age rather than by
+    // what is still needed, and a player who stands still long enough can have
+    // the input that set their current direction fall off the end of it.
+    while (sentInputs.length > 1 && sentInputs[0].seq < sp.ackSeq) sentInputs.shift()
 
     // Remember what the host said, and from now on derive from it. The actual
     // position is computed in deriveLocalPosition, which runs every frame — the
@@ -6029,12 +6171,14 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
 
   /** Guests reconcile their world to the host's snapshot. */
   function applySnapshot(snapshot: WorldSnapshot): void {
+    let hudDirty = false
+
     for (const sp of snapshot.players) {
-      const np = netPlayerById(sp.id)
+      const np = netPlayerBySlot(sp.slot)
       if (!np) continue
       // A drop in lives is the only signal a guest gets that someone was hit,
       // so the feedback has to be raised here rather than in explodeBomb.
-      if (sp.lives < np.lives) {
+      if (sp.stats && sp.stats.lives < np.lives) {
         showHitIndicator(gridToWorld(sp.x, sp.y), scene, np.isLocal)
         if (np.isLocal) {
           if (soundManager) soundManager.playSFX('death')
@@ -6059,35 +6203,50 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
           np.moveDelay,
           // Never behind what is already on screen, or a refill after a stall
           // is drawn as an arrival rather than a walk.
-          arrivedAt - INTERP_DELAY_MS,
+          arrivedAt - interpDelayMs,
         )
       }
 
-      np.lives = sp.lives
-      np.maxBombs = sp.bombs
-      np.blastRadius = sp.blast
-      // Speed gates how often prediction may step, so it has to track the host.
-      // Without it a guest kept stepping every 150ms after picking up Speed
-      // while the host ran them at up to 60ms — so every snapshot arrived one to
-      // three tiles ahead and dragged them forward, which is what read as
-      // "moved too far" and as lag.
-      np.speed = sp.speed
-      np.moveDelay = moveDelayForSpeed(sp.speed)
-      np.invulnerable = sp.invulnerable
-      np.hasKick = sp.kick
-      np.hasThrow = sp.throwing
-      np.shieldCharges = sp.shield
-      np.hasPierce = sp.pierce
-      np.ghostTimer = sp.ghost
-      np.powerBombCharges = sp.powerBomb
-      np.hasLineBomb = sp.lineBomb
+      // The loadout, present only when the host has something new to say about
+      // it. Absent is not "nothing" — it means keep what you have.
+      if (sp.stats) {
+        const before = statsSignature(np)
+        np.lives = sp.stats.lives
+        np.maxBombs = sp.stats.bombs
+        np.blastRadius = sp.stats.blast
+        // Speed gates how often prediction may step, so it has to track the
+        // host. Without it a guest kept stepping every 150ms after picking up
+        // Speed while the host ran them at up to 90ms — so every snapshot
+        // arrived one to three tiles ahead and dragged them forward, which is
+        // what read as "moved too far" and as lag.
+        np.speed = sp.stats.speed
+        np.moveDelay = moveDelayForSpeed(sp.stats.speed)
+        np.invulnerable = sp.stats.invulnerable
+        np.hasKick = sp.stats.kick
+        np.hasThrow = sp.stats.throwing
+        np.shieldCharges = sp.stats.shield
+        np.hasPierce = sp.stats.pierce
+        np.ghostTimer = sp.stats.ghost
+        np.powerBombCharges = sp.stats.powerBomb
+        np.hasLineBomb = sp.stats.lineBomb
+        // The HUD is rebuilt only when something it draws really moved.
+        //
+        // Marking it dirty on every snapshot put a full innerHTML rebuild of
+        // both panels — health bars, a dozen emoji power-up tiles and the whole
+        // roster — on very nearly every frame, a cost the host never pays, and
+        // it was a large part of why guests felt heavy on phones. Comparing
+        // against what we held rather than against "were we sent stats" keeps
+        // the once-a-second keyframe from reintroducing it.
+        if (before !== statsSignature(np)) hudDirty = true
+      }
 
       if (np.alive !== sp.alive) {
         np.alive = sp.alive
         setCharacterVisibility(np.mesh, sp.alive ? 1 : 0)
-      } else if (sp.alive) {
+        hudDirty = true
+      } else if (sp.alive && np.ghostTimer > 0) {
         // Ghosted players are see-through on every screen, not just the host's.
-        setCharacterVisibility(np.mesh, sp.ghost > 0 ? 0.5 : 1)
+        setCharacterVisibility(np.mesh, 0.5)
       }
       // Walk cycle, gated on `moving` rather than on facing.
       //
@@ -6165,33 +6324,31 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       playRemoteBlast(snapshot.blasts)
     }
 
-    // Power-ups.
-    const livePowerUps = new Set<string>()
-    for (const pu of snapshot.powerUps) {
-      const key = `${pu.x},${pu.y}`
-      livePowerUps.add(key)
-      if (!guestPowerUpMeshes.has(key)) {
-        const pos = gridToWorld(pu.x, pu.y)
-        const plane = MeshBuilder.CreatePlane('powerup-emoji', { size: TILE_SIZE * 0.8 }, scene)
-        plane.position.x = pos.x
-        plane.position.y = TILE_SIZE * 0.5
-        plane.position.z = pos.z
-        plane.billboardMode = 7
-        plane.material = getPowerUpMaterial(pu.type as PowerUpType)
-        guestPowerUpMeshes.set(key, plane)
+    // Power-ups, carried only when the set of them changed.
+    if (snapshot.powerUps) {
+      const livePowerUps = new Set<string>()
+      for (const pu of snapshot.powerUps) {
+        const key = `${pu.x},${pu.y}`
+        livePowerUps.add(key)
+        if (!guestPowerUpMeshes.has(key)) {
+          const pos = gridToWorld(pu.x, pu.y)
+          const plane = MeshBuilder.CreatePlane('powerup-emoji', { size: TILE_SIZE * 0.8 }, scene)
+          plane.position.x = pos.x
+          plane.position.y = TILE_SIZE * 0.5
+          plane.position.z = pos.z
+          plane.billboardMode = 7
+          plane.material = getPowerUpMaterial(pu.type as PowerUpType)
+          guestPowerUpMeshes.set(key, plane)
+        }
+      }
+      for (const [key, mesh] of [...guestPowerUpMeshes]) {
+        if (livePowerUps.has(key)) continue
+        mesh.dispose()
+        guestPowerUpMeshes.delete(key)
       }
     }
-    for (const [key, mesh] of [...guestPowerUpMeshes]) {
-      if (livePowerUps.has(key)) continue
-      mesh.dispose()
-      guestPowerUpMeshes.delete(key)
-    }
 
-    const signature = hudSignature(snapshot)
-    if (signature !== lastHudSignature) {
-      lastHudSignature = signature
-      updateUI()
-    }
+    if (hudDirty) updateUI()
   }
 
   /**
@@ -6320,9 +6477,12 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     const net = online.net
     const winnerId = alive.length === 1 ? alive[0].id : null
 
-    // Push the killing blast and the death out now, ahead of the result.
-    net.send({ t: 'state', tick: Date.now(), payload: buildSnapshot() })
+    // Push the killing blast and the death out now, ahead of the result. Sent
+    // in full: this is the last thing anyone hears about the round, so it is
+    // the wrong moment to assume a guest already knows something.
+    net.send({ t: 'state', tick: Date.now(), payload: buildSnapshot(true) })
     lastSnapshotAt = Date.now()
+    lastFullSnapshotAt = lastSnapshotAt
 
     const timer = setTimeout(() => net.send({ t: 'roundResult', winnerId }), ROUND_OVER_GRACE_MS)
     scene.onDisposeObservable.add(() => clearTimeout(timer))
@@ -6381,11 +6541,17 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       // is a tile it will happily predict itself onto and then be pulled off.
       // The tick bounds this at ~30Hz, and an idle arena still costs the old
       // 15Hz, so the extra traffic only appears while something is happening.
+      // Taken once and handed on to buildSnapshot as the new baseline: it was
+      // being built twice per tick, once to decide whether to send and again to
+      // record what had been sent, with nothing able to change in between.
+      const world = worldFingerprint()
       const hasEvents =
-        pendingBlasts.length > 0 || pendingCleared.length > 0 || worldChangedSinceSnapshot()
+        pendingBlasts.length > 0 || pendingCleared.length > 0 || world !== lastSentWorld
       if (hasEvents || now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS) {
+        const full = now - lastFullSnapshotAt >= FULL_SNAPSHOT_INTERVAL_MS
+        if (full) lastFullSnapshotAt = now
         lastSnapshotAt = now
-        online.net.send({ t: 'state', tick: now, payload: buildSnapshot() })
+        online.net.send({ t: 'state', tick: now, payload: buildSnapshot(full, world) })
       }
     } else {
       // Safety net only — the frame loop normally does both of these, and does
@@ -6429,9 +6595,6 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
       at: stampedAt,
       ackTick: lastAppliedTick,
     })
-    // Note when it went out so the ack can be turned into a round trip.
-    inputSentAt.set(localInputSeq, Date.now())
-    if (inputSentAt.size > 64) inputSentAt.delete(inputSentAt.keys().next().value!)
 
     // Keep it for replay. The same stamp goes to the host and into the buffer,
     // so what we re-derive is exactly what the host was told.
@@ -6508,10 +6671,17 @@ function createScene(engine: Engine, gameMode: GameMode, online?: OnlineContext)
     // so it is already the present, and delaying it would make the controls
     // feel dead.
     const buffered = online !== undefined && !online.isHost
-    const drawAt = Date.now() - INTERP_DELAY_MS
+    const drawAt = Date.now() - interpDelayMs
     for (const np of netPlayers) {
       if (buffered && !np.isLocal) drawReportedPlayer(np, drawAt)
       else advanceNetVisual(np, deltaTime)
+      // Ghost runs down on the host, which owns the clock for it, and reaches a
+      // guest only when the loadout is resent. Running it down here as well
+      // keeps the see-through fade smooth, and — because prediction asks
+      // whether it is still ghosting before walking through a crate — keeps a
+      // guest from predicting its way into a wall on the strength of a
+      // power-up that has already expired.
+      if (buffered) updateGuestGhost(np, deltaTime)
       np.mesh.position.x = np.visualX
       np.mesh.position.z = np.visualZ
     }

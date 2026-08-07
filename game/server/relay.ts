@@ -21,7 +21,6 @@ export type DeliverLocally = (envelope: RelayEnvelope) => void
 
 export interface Relay {
   publish(envelope: RelayEnvelope): void
-  close(): Promise<void>
 }
 
 const CHANNEL = 'whatabomb:relay'
@@ -36,7 +35,6 @@ export function createLocalRelay(deliver: DeliverLocally): Relay {
     publish(envelope) {
       deliver(envelope)
     },
-    async close() {},
   }
 }
 
@@ -83,6 +81,5 @@ export async function createRedisRelay(
         console.error('[relay] publish failed', err)
       })
     },
-    async close() {},
   }
 }

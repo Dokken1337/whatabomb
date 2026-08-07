@@ -120,6 +120,9 @@ function newGuest(x, y, delay) {
     x, y, credit: delay, delay, sent: [], seq: 0, lastSignature: null,
     auth: { x, y, credit: delay },
     simAt: 0,
+    // No authoritative ground to stand on: set while a reconnect is pending, so
+    // nothing is derived until the host says something again.
+    blind: false,
   }
 }
 
@@ -143,15 +146,33 @@ function guestPublish(g, input, now) {
  * disagreement by removing the second answer.
  */
 function guestDerive(g, now, canWalk) {
+  if (g.blind) return
   const d = replay(g.auth, g.delay, g.sent, g.simAt, now, canWalk)
   g.x = d.x; g.y = d.y; g.credit = d.credit
 }
 
 /** reconcileLocal: re-derive from the authoritative state. */
 function guestReconcile(g, snap, now, canWalk) {
+  while (g.sent.length > 1 && g.sent[0].seq < snap.ackSeq) g.sent.shift()
   g.auth = { x: snap.x, y: snap.y, credit: snap.credit }
   g.simAt = snap.simAt
+  g.blind = false
   guestDerive(g, now, canWalk)
+}
+
+/**
+ * The scene's onState handler: throw away everything predicted across a gap.
+ *
+ * The inputs still in the buffer are stamped from before the outage, and the
+ * host — told by the server that this player had gone — stopped simulating
+ * them at the moment they left. Replaying the buffer against whatever it says
+ * next would therefore charge the whole outage to a direction that has been
+ * held throughout, and spend it walking.
+ */
+function guestResumed(g) {
+  g.sent.length = 0
+  g.blind = true
+  g.lastSignature = null
 }
 
 // ── The wire ────────────────────────────────────────────────────────────────
@@ -161,7 +182,16 @@ function guestReconcile(g, snap, now, canWalk) {
  *
  * `script` is a list of [holdMs, dx, dy]; a zero direction is a pause.
  */
-function playMatch({ script, oneWay = 80, delay = 150, canWalk = openWorld() }) {
+function playMatch({
+  script,
+  oneWay = 80,
+  delay = 150,
+  canWalk = openWorld(),
+  /** `{ from, until }` in ms from the start: the guest's socket is down. */
+  outage = null,
+  /** Whether the guest discards its prediction on coming back. */
+  recoverPrediction = true,
+}) {
   const h = newHost(5, 5, delay)
   const g = newGuest(5, 5, delay)
 
@@ -188,12 +218,28 @@ function playMatch({ script, oneWay = 80, delay = 150, canWalk = openWorld() }) 
   }
   const total = cursor + 1500 // let everything settle
 
+  const outageFrom = outage ? T0 + outage.from : Infinity
+  const outageUntil = outage ? T0 + outage.until : -Infinity
+  let wasDown = false
+
   let lastSnapshotAt = T0
   for (let t = T0; t <= total; t += TICK) {
+    const down = t >= outageFrom && t < outageUntil
+    if (down && !wasDown) {
+      // The server tells the host this player has gone, and the host stops
+      // simulating them — otherwise a held direction walks a disconnected
+      // character across the arena for the whole outage. See the scene's
+      // onLobby handler.
+      h.input = { dx: 0, dy: 0 }
+      h.creditedSinceInput = 0
+    }
+    if (!down && wasDown && recoverPrediction) guestResumed(g)
+    wasDown = down
+
     // Guest tick: publish on change, then predict.
     const held = heldAt(t)
     const msg = guestPublish(g, held, t)
-    if (msg) toHost.push({ at: t + oneWay, msg })
+    if (msg && !down) toHost.push({ at: t + oneWay, msg })
     guestDerive(g, t, canWalk)
 
     // Host tick: take delivered input, then simulate, then maybe report.
@@ -201,7 +247,7 @@ function playMatch({ script, oneWay = 80, delay = 150, canWalk = openWorld() }) 
     hostTick(h, TICK, canWalk)
     if (t - lastSnapshotAt >= SNAPSHOT_EVERY) {
       lastSnapshotAt = t
-      toGuest.push({ at: t + oneWay, snap: hostSnapshot(h) })
+      if (!down) toGuest.push({ at: t + oneWay, snap: hostSnapshot(h) })
     }
 
     // Guest applies whatever has arrived.
@@ -212,6 +258,17 @@ function playMatch({ script, oneWay = 80, delay = 150, canWalk = openWorld() }) 
     timeline.push({ t, held, guest: [g.x, g.y], host: [h.x, h.y] })
   }
   return { host: h, guest: g, timeline }
+}
+
+/** The largest single-frame jump the guest made, in tiles. */
+function largestJump(timeline) {
+  let worst = 0
+  for (let i = 1; i < timeline.length; i++) {
+    const a = timeline[i - 1], b = timeline[i]
+    const jump = Math.abs(b.guest[0] - a.guest[0]) + Math.abs(b.guest[1] - a.guest[1])
+    if (jump > worst) worst = jump
+  }
+  return worst
 }
 
 /**
@@ -312,6 +369,42 @@ test('speed does not break agreement', () => {
     )
     assert.deepEqual(phantomMoves(timeline), [], `phantom at ${delay}ms per tile`)
   }
+})
+
+/**
+ * A four-second drop in the middle of a long hold — the worst shape for this,
+ * because both ends have every reason to believe the player is still walking
+ * and neither is told otherwise until it is over.
+ */
+const acrossADrop = {
+  script: [[600, 0, 1], [4000, 0, 1], [600, 0, 1], [600, 0, 0]],
+  outage: { from: 600, until: 4600 },
+}
+
+test('a reconnecting guest does not walk the outage off', () => {
+  const { host, guest, timeline } = playMatch(acrossADrop)
+
+  assert.deepEqual(
+    [guest.x, guest.y], [host.x, host.y],
+    `ends disagree after a reconnect: guest ${guest.x},${guest.y} host ${host.x},${host.y}`,
+  )
+  assert.ok(
+    largestJump(timeline) <= 1,
+    `the guest jumped ${largestJump(timeline)} tiles at once; coming back should ` +
+      `resume from where the host says, not replay the whole gap`,
+  )
+})
+
+test('keeping the pre-drop prediction is what would teleport them', () => {
+  // The same match with the recovery left out, to show the reset is carrying
+  // real weight rather than being belt and braces. Without it the buffer still
+  // holds an input stamped before the outage, and the first snapshot back
+  // charges the entire gap to it.
+  const { timeline } = playMatch({ ...acrossADrop, recoverPrediction: false })
+  assert.ok(
+    largestJump(timeline) > 1,
+    'expected the unfixed path to jump, so this test still proves something',
+  )
 })
 
 test('a wall the guest can also see does not cause disagreement', () => {

@@ -6,74 +6,21 @@
  */
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { WebSocket } from 'ws'
+import { startServer, connect as openSocket } from './harness.mjs'
 
 const PORT = 8099
-const URL = `ws://127.0.0.1:${PORT}/ws`
 
-let serverProcess
+let server
 
 before(async () => {
-  serverProcess = spawn(process.execPath, ['dist-server/server/index.js'], {
-    env: { ...process.env, PORT: String(PORT) },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  serverProcess.stderr.on('data', d => process.stderr.write(`[server] ${d}`))
-
-  // Wait for the listen line before connecting.
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('server did not start')), 10_000)
-    serverProcess.stdout.on('data', chunk => {
-      if (chunk.toString().includes('listening on')) {
-        clearTimeout(timer)
-        resolve()
-      }
-    })
-  })
+  server = await startServer(PORT)
 })
 
 after(() => {
-  serverProcess?.kill()
+  server?.stop()
 })
 
-/** A socket wrapper that queues messages so tests can await them by type. */
-function connect() {
-  const socket = new WebSocket(URL)
-  const queue = []
-  const waiters = []
-
-  socket.on('message', raw => {
-    const msg = JSON.parse(raw.toString())
-    const waiterIndex = waiters.findIndex(w => w.type === msg.t)
-    if (waiterIndex !== -1) {
-      const [waiter] = waiters.splice(waiterIndex, 1)
-      clearTimeout(waiter.timer)
-      waiter.resolve(msg)
-    } else {
-      queue.push(msg)
-    }
-  })
-
-  return {
-    socket,
-    open: () => new Promise(res => socket.once('open', res)),
-    send: msg => socket.send(JSON.stringify(msg)),
-    /** Resolve with the next message of `type`, checking already-queued ones. */
-    next(type, timeoutMs = 5000) {
-      const queued = queue.findIndex(m => m.t === type)
-      if (queued !== -1) return Promise.resolve(queue.splice(queued, 1)[0])
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error(`timed out waiting for "${type}"`)),
-          timeoutMs,
-        )
-        waiters.push({ type, resolve, timer })
-      })
-    },
-    close: () => socket.close(),
-  }
-}
+const connect = () => openSocket(server.url)
 
 async function joinedClient(name, code) {
   const client = connect()

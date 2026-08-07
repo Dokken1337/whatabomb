@@ -198,22 +198,6 @@ export function replay(
   return state
 }
 
-/**
- * The input in effect at a given moment, or null if the buffer starts later.
- *
- * Replay needs this when the authority has simulated past the start of the
- * buffer: the direction being held at `simThrough` may have been set by an
- * input the authority already acknowledged.
- */
-export function inputAt(inputs: TimedInput[], at: number): TimedInput | null {
-  let found: TimedInput | null = null
-  for (const input of inputs) {
-    if (input.at <= at) found = input
-    else break
-  }
-  return found
-}
-
 // ── Drawing somebody else ────────────────────────────────────────────────────
 //
 // A player you are not predicting can only be drawn from what the authority

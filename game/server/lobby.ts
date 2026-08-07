@@ -34,9 +34,6 @@ export interface LobbyRecord {
   updatedAt: number
 }
 
-/** Grace period a disconnected player keeps their seat before being dropped. */
-export const RECONNECT_GRACE_MS = 30_000
-
 /**
  * A lobby with nobody connected is swept after this long. Lobbies that still
  * have a connected player are never reaped, however long they sit idle — people

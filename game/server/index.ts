@@ -10,19 +10,21 @@ import {
   HEARTBEAT_TIMEOUT_MS,
   MAX_MESSAGE_BYTES,
   PROTOCOL_VERSION,
+  RECONNECT_GRACE_MS,
   isValidLobbyCode,
   type ClientMessage,
   type ErrorCode,
+  type InputMessage,
   type LobbyStatus,
   type LobbyView,
   type ServerMessage,
+  type StateMessage,
 } from '../shared/protocol.js'
 import { InMemoryLobbyStore, RedisLobbyStore, type LobbyStore } from './lobby-store.js'
 import { connectRedis, type RedisConnections } from './redis.js'
 import { createLocalRelay, createRedisRelay, type Relay, type RelayEnvelope } from './relay.js'
 import {
   IDLE_LOBBY_TTL_MS,
-  RECONNECT_GRACE_MS,
   LobbyFullError,
   LobbyInProgressError,
   addPlayer,
@@ -120,6 +122,43 @@ interface Connection {
 
 const connections = new Map<WebSocket, Connection>()
 
+/**
+ * Sockets grouped by the lobby they are seated in.
+ *
+ * Delivery used to scan every connection on the instance and filter, which is
+ * fine for one lobby and quadratic for a hundred: with Redis every instance
+ * sees every envelope for every lobby, and a match in progress produces up to
+ * thirty of them a second. That put the cost of one busy lobby onto every
+ * player of every other one. The index makes delivery cost what it should —
+ * the number of people actually being written to.
+ */
+const lobbyConnections = new Map<string, Set<Connection>>()
+
+/** Seat a connection in a lobby, keeping the index in step. */
+function seatConnection(connection: Connection, code: string, playerId: string): void {
+  unseatConnection(connection)
+  connection.lobbyCode = code
+  connection.playerId = playerId
+  let seated = lobbyConnections.get(code)
+  if (!seated) {
+    seated = new Set()
+    lobbyConnections.set(code, seated)
+  }
+  seated.add(connection)
+}
+
+/** Take a connection out of whatever lobby it was in. Safe to call twice. */
+function unseatConnection(connection: Connection): void {
+  const code = connection.lobbyCode
+  connection.lobbyCode = null
+  connection.playerId = null
+  if (!code) return
+  const seated = lobbyConnections.get(code)
+  if (!seated) return
+  seated.delete(connection)
+  if (seated.size === 0) lobbyConnections.delete(code)
+}
+
 const wss = new WebSocketServer({
   server,
   path: '/ws',
@@ -143,14 +182,21 @@ function sendError(socket: WebSocket, code: ErrorCode, message: string): void {
 }
 
 /**
- * Sockets this instance is holding for `code`, filtered to the addressed
- * players. Other instances run the same function over their own sockets.
+ * Deliver to whichever of the addressed players this instance is holding.
+ *
+ * Other instances run the same thing over their own sockets, so between them
+ * everyone addressed is reached exactly once, wherever they happen to be
+ * pinned.
  */
-function localConnectionsFor(code: string, playerIds: string[] | null): Connection[] {
+function sendToLocal(code: string, playerIds: string[] | null, message: ServerMessage): void {
+  const seated = lobbyConnections.get(code)
+  if (!seated) return
   const wanted = playerIds ? new Set(playerIds) : null
-  return [...connections.values()].filter(
-    c => c.lobbyCode === code && c.playerId && (!wanted || wanted.has(c.playerId)),
-  )
+  for (const connection of seated) {
+    if (!connection.playerId) continue
+    if (wanted && !wanted.has(connection.playerId)) continue
+    send(connection.socket, message)
+  }
 }
 
 /**
@@ -202,9 +248,7 @@ function deliverLocally(envelope: RelayEnvelope): void {
   const carried = (envelope.message as { lobby?: LobbyView }).lobby
   if (carried) rememberLobby(carried)
 
-  for (const connection of localConnectionsFor(envelope.code, envelope.to)) {
-    send(connection.socket, envelope.message)
-  }
+  sendToLocal(envelope.code, envelope.to, envelope.message)
 }
 
 /**
@@ -225,6 +269,48 @@ function broadcastLobby(lobby: LobbyRecord): void {
 async function loadLobbyFor(connection: Connection): Promise<LobbyRecord | undefined> {
   if (!connection.lobbyCode) return undefined
   return store.get(connection.lobbyCode)
+}
+
+/**
+ * Forward one piece of gameplay traffic. Pure relay: the server never opens a
+ * snapshot or judges a move, it only decides who is entitled to hear it.
+ */
+function relayGameplay(
+  match: MatchContext,
+  connection: Connection,
+  message: InputMessage | StateMessage,
+): void {
+  if (match.status !== 'playing') return
+
+  if (message.t === 'input') {
+    // Guests send inputs; only the host needs them.
+    if (!connection.playerId) return
+    relayTo(match.code, [match.hostId], {
+      t: 'relayInput',
+      playerId: connection.playerId,
+      seq: Number(message.seq) || 0,
+      dx: Math.sign(Number(message.dx) || 0),
+      dy: Math.sign(Number(message.dy) || 0),
+      bomb: Boolean(message.bomb),
+      // Timing the host needs, passed through untouched. Both are read only
+      // against a clock the reader already owns, so the relay has no business
+      // rewriting them — see InputMessage.
+      at: Number(message.at) || 0,
+      ackTick: Number(message.ackTick) || 0,
+    })
+    return
+  }
+
+  // Only the host may describe the world.
+  if (match.hostId !== connection.playerId) return
+  const guests = match.playerIds.filter(id => id !== match.hostId)
+  if (guests.length === 0) return
+
+  relayTo(match.code, guests, {
+    t: 'relayState',
+    tick: Number(message.tick) || 0,
+    payload: message.payload,
+  })
 }
 
 /**
@@ -260,7 +346,7 @@ wss.on('connection', socket => {
     connection.lastSeen = Date.now()
   })
 
-  socket.on('message', async raw => {
+  socket.on('message', raw => {
     connection.lastSeen = Date.now()
 
     if (overRateLimit(connection)) {
@@ -280,17 +366,38 @@ wss.on('connection', socket => {
       return
     }
 
-    try {
-      await handleMessage(connection, message)
-    } catch (err) {
+    // Inputs and snapshots take a synchronous path whenever the roster is
+    // already cached, which is all the time once a match is under way.
+    //
+    // Not only for the saved allocations. Every handler here is independent, so
+    // two messages that both suspend on an await resume in whatever order their
+    // awaits happen to settle — and a message that takes the slow path can
+    // therefore overtake one sent before it. Gameplay traffic is the one kind
+    // where that matters and the one kind that never needs to wait for
+    // anything, so it is kept off the async path entirely.
+    if (message.t === 'input' || message.t === 'state') {
+      const match = connection.lobbyCode ? matchCache.get(connection.lobbyCode) : undefined
+      if (match) {
+        relayGameplay(match, connection, message)
+        return
+      }
+    }
+
+    handleMessage(connection, message).catch(err => {
       console.error('[ws] handler failed', err)
       sendError(socket, 'internal', 'Something went wrong')
-    }
+    })
   })
 
   socket.on('close', () => {
-    void handleDisconnect(connection)
+    const { lobbyCode, playerId } = connection
+    unseatConnection(connection)
     connections.delete(socket)
+    if (lobbyCode && playerId) {
+      void releaseSeat(lobbyCode, playerId).catch(err => {
+        console.error('[ws] releasing seat failed', err)
+      })
+    }
   })
 
   socket.on('error', err => {
@@ -316,8 +423,7 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
       const lobby = createLobby(code, message.name)
       await store.set(code, lobby)
 
-      connection.lobbyCode = code
-      connection.playerId = lobby.hostId
+      seatConnection(connection, code, lobby.hostId)
       send(socket, { t: 'joined', youId: lobby.hostId, lobby: toView(lobby) })
       return
     }
@@ -368,8 +474,7 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         return
       }
 
-      connection.lobbyCode = outcome.lobby.code
-      connection.playerId = outcome.playerId
+      seatConnection(connection, outcome.lobby.code, outcome.playerId)
 
       send(socket, { t: 'joined', youId: outcome.playerId, lobby: toView(outcome.lobby) })
       broadcastLobby(outcome.lobby)
@@ -406,17 +511,16 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         return
       }
 
-      connection.lobbyCode = resumed.code
-      connection.playerId = message.playerId
+      seatConnection(connection, resumed.code, message.playerId)
       send(socket, { t: 'joined', youId: message.playerId, lobby: toView(resumed) })
       broadcastLobby(resumed)
       return
     }
 
     case 'leave': {
-      await handleDisconnect(connection, { immediate: true })
-      connection.lobbyCode = null
-      connection.playerId = null
+      const { lobbyCode, playerId } = connection
+      unseatConnection(connection)
+      if (lobbyCode && playerId) await releaseSeat(lobbyCode, playerId, { immediate: true })
       return
     }
 
@@ -495,43 +599,12 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
       return
     }
 
-    case 'input': {
-      // Guests send inputs; only the host needs them. Served from the cached
-      // roster rather than a store read — this runs at input rate, and a cache
-      // round trip per keypress would put Redis in the movement path.
-      const match = await matchContext(connection)
-      if (!match || !connection.playerId || match.status !== 'playing') return
-
-      relayTo(match.code, [match.hostId], {
-        t: 'relayInput',
-        playerId: connection.playerId,
-        seq: Number(message.seq) || 0,
-        dx: Math.sign(Number(message.dx) || 0),
-        dy: Math.sign(Number(message.dy) || 0),
-        bomb: Boolean(message.bomb),
-        // Timing the host needs, passed through untouched. Both are read only
-        // against a clock the reader already owns, so the relay has no business
-        // rewriting them — see InputMessage.
-        at: Number(message.at) || 0,
-        ackTick: Number(message.ackTick) || 0,
-      })
-      return
-    }
-
+    case 'input':
     case 'state': {
-      // Only the host may describe the world. Cached for the same reason as
-      // input, more so: snapshots go out around fifteen times a second.
+      // Only reached when the roster was not cached — see relayGameplay, which
+      // handles these synchronously in the common case.
       const match = await matchContext(connection)
-      if (!match || match.hostId !== connection.playerId || match.status !== 'playing') return
-
-      const guests = match.playerIds.filter(id => id !== match.hostId)
-      if (guests.length === 0) return
-
-      relayTo(match.code, guests, {
-        t: 'relayState',
-        tick: Number(message.tick) || 0,
-        payload: message.payload,
-      })
+      if (match) relayGameplay(match, connection, message)
       return
     }
 
@@ -581,14 +654,18 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
   }
 }
 
-async function handleDisconnect(
-  connection: Connection,
+/**
+ * Give up a seat, either holding it for a reconnect or vacating it outright.
+ *
+ * Takes the code and player explicitly rather than reading them off the
+ * connection: callers unseat the connection immediately, and this runs across
+ * awaits, so reading them here would be reading them after they were cleared.
+ */
+async function releaseSeat(
+  code: string,
+  playerId: string,
   options: { immediate?: boolean } = {},
 ): Promise<void> {
-  if (!connection.lobbyCode || !connection.playerId) return
-  const code = connection.lobbyCode
-  const playerId = connection.playerId
-
   const lobby = await store.withLock(code, async () => {
     const current = await store.get(code)
     if (!current) return null
@@ -645,7 +722,24 @@ const heartbeat = setInterval(() => {
 const sweep = setInterval(() => {
   void (async () => {
     const now = Date.now()
-    for (const snapshot of await store.values()) {
+    const lobbies = await store.values()
+
+    // Forget lobbies that no longer exist.
+    //
+    // The roster cache is filled from relay traffic, which every instance sees
+    // for every lobby — so every instance ends up holding an entry for every
+    // lobby in the cluster, while only the one that happens to reap a lobby
+    // deletes its own copy. The others kept theirs for the life of the process.
+    // Reconciling against the store here is what stops that being a slow leak
+    // on every instance but one. Anything wrongly dropped — a lobby created
+    // between the scan and now — is simply re-read from the store on its next
+    // message.
+    const alive = new Set(lobbies.map(lobby => lobby.code))
+    for (const code of [...matchCache.keys()]) {
+      if (!alive.has(code)) matchCache.delete(code)
+    }
+
+    for (const snapshot of lobbies) {
       // Re-read under the lock: a join landing on another instance between the
       // scan and the write would otherwise be erased by this pass.
       const result = await store.withLock(snapshot.code, async () => {
@@ -694,7 +788,8 @@ server.listen(port, () => {
 
 function shutdown(signal: string): void {
   console.log(`[whatabomb] ${signal} received, shutting down`)
-  void relay.close()
+  // Closing the Redis connections is what tears the relay down; the relay
+  // itself holds nothing of its own to release.
   void redis?.close()
   clearInterval(heartbeat)
   clearInterval(sweep)

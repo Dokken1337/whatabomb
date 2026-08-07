@@ -1,4 +1,6 @@
 import {
+  PROTOCOL_VERSION,
+  reconnectBackoff,
   type ClientMessage,
   type ErrorMessage,
   type LobbyView,
@@ -11,8 +13,14 @@ import {
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
 
-/** Backoff between reconnect attempts, in ms. Gives up after the last one. */
-const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000]
+/**
+ * Backoff between reconnect attempts, in ms. Gives up after the last one.
+ *
+ * Spans the server's grace period by construction, so the attempt that finally
+ * fails is failing because the seat really is gone rather than because the
+ * schedule ran out first. See reconnectBackoff.
+ */
+const RECONNECT_DELAYS_MS = reconnectBackoff()
 
 export interface NetHandlers {
   onState?: (state: ConnectionState) => void
@@ -62,8 +70,6 @@ export class NetClient {
   youId: string | null = null
   /** Last lobby snapshot received, for UI that renders on demand. */
   lobby: LobbyView | null = null
-  /** Round-trip time in ms, refreshed by the keepalive ping. */
-  latency = 0
 
   private url: string
 
@@ -75,10 +81,6 @@ export class NetClient {
 
   setHandlers(handlers: NetHandlers): void {
     this.handlers = handlers
-  }
-
-  getState(): ConnectionState {
-    return this.state
   }
 
   isConnected(): boolean {
@@ -123,8 +125,7 @@ export class NetClient {
         if (this.resumeAs) {
           this.send({ t: 'resume', code: this.resumeAs.code, playerId: this.resumeAs.playerId })
         }
-        // Keeps intermediaries from dropping an idle socket and doubles as a
-        // latency probe for the lobby UI.
+        // Keeps intermediaries from dropping an idle socket.
         this.pingTimer = setInterval(() => {
           this.send({ t: 'ping', ts: Date.now() })
         }, 20_000)
@@ -164,6 +165,23 @@ export class NetClient {
   private dispatch(msg: ServerMessage): void {
     switch (msg.t) {
       case 'welcome':
+        // The server has just said what it speaks. Until now this was read and
+        // thrown away, which meant a mismatch was discovered the hard way —
+        // as a match that starts and then behaves oddly, because a snapshot in
+        // a shape this build does not know is not an error, it is a snapshot
+        // full of undefined. That case is routine rather than exotic: the
+        // service worker serves the app shell from cache, so any player who
+        // has not reloaded since the last deploy is a build behind.
+        if (msg.protocol !== PROTOCOL_VERSION) {
+          this.leaving = true
+          this.resumeAs = null
+          this.handlers.onError?.({
+            t: 'error',
+            code: 'bad_request',
+            message: 'This page is out of date — reload to play online',
+          })
+          this.socket?.close()
+        }
         break
       case 'joined':
         this.youId = msg.youId
@@ -194,7 +212,8 @@ export class NetClient {
         this.handlers.onError?.(msg)
         break
       case 'pong':
-        this.latency = Date.now() - msg.ts
+        // Nothing to do with it — the ping exists to keep intermediaries from
+        // dropping an idle socket, and the reply only confirms it worked.
         break
     }
   }
@@ -232,11 +251,6 @@ export class NetClient {
       // swallow it rather than leaving an unhandled rejection behind.
       void this.connect().catch(() => {})
     }, delay)
-  }
-
-  /** True while the socket is down but the seat may still be recoverable. */
-  isRecovering(): boolean {
-    return this.state === 'reconnecting'
   }
 
   send(message: ClientMessage): void {
